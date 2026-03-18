@@ -194,6 +194,49 @@ app.get('/api/users/:id', requireAuth, async (req, res) => {
   }
 });
 
+// Update user profile (name, avatar)
+app.put('/api/users/profile', requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { name, avatar } = req.body;
+
+    if (!name && !avatar) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    // Build dynamic update
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) {
+      const trimmed = String(name).trim().substring(0, 50);
+      if (!trimmed) return res.status(400).json({ error: 'Name cannot be empty' });
+      updates.push(`name = $${paramIndex++}`);
+      values.push(trimmed);
+    }
+
+    if (avatar !== undefined) {
+      // avatar can be a base64 string or null (to remove)
+      updates.push(`avatar = $${paramIndex++}`);
+      values.push(avatar);
+    }
+
+    values.push(userId);
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+    const { rows } = await pool.query(query, values);
+
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+
+    // Get full user with balance
+    const fullUser = await db.findUserById(userId);
+    res.json({ success: true, user: formatUserForClient(fullUser) });
+  } catch (err) {
+    console.error('Update profile error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users/:id/transactions', requireAuth, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
@@ -594,6 +637,7 @@ function formatUserForClient(user) {
     phone: user.phone,
     role: user.role,
     balance: user.balance != null ? parseFloat(user.balance) : 0,
+    avatar: user.avatar || null,
   };
 }
 
