@@ -60,7 +60,7 @@ async function getCreators() {
     SELECT
       u.id, u.name, u.role, u.bio,
       c.rate, c.languages, c.categories, c.image_color AS "imageColor",
-      c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
+      c.avatar_url, c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
     WHERE u.role = 'creator'
@@ -74,7 +74,7 @@ async function getCreatorById(id) {
     SELECT
       u.id, u.name, u.role, u.bio,
       c.rate, c.languages, c.categories, c.image_color AS "imageColor",
-      c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
+      c.avatar_url, c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
     WHERE u.id = $1
@@ -239,6 +239,7 @@ async function getUserCalls(userId, page = 1, limit = 20) {
       c.id,
       u.name AS "creatorName",
       cr.image_color AS "creatorColor",
+      cr.avatar_url AS "creatorAvatarUrl",
       c.duration_seconds AS "durationSeconds",
       c.total_cost AS cost,
       c.created_at AS timestamp
