@@ -113,7 +113,9 @@ async function createTransaction(userId, amount, type, status = 'success') {
   return rows[0];
 }
 
-async function getUserTransactions(userId) {
+async function getUserTransactions(userId, page = 1, limit = 20) {
+  const offset = (page - 1) * limit;
+
   // Get top-up transactions
   const { rows: topups } = await pool.query(`
     SELECT id, amount, type, status, created_at AS timestamp
@@ -183,21 +185,33 @@ async function getUserTransactions(userId) {
   const combined = [...topupEntries, ...callEntries, initialEntry]
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-  return combined;
+  // Paginate the combined result
+  const total = combined.length;
+  const paginated = combined.slice(offset, offset + limit);
+
+  return { data: paginated, page, limit, total, hasMore: offset + limit < total };
 }
 
-async function getUserRecharges(userId) {
+async function getUserRecharges(userId, page = 1, limit = 20) {
+  const offset = (page - 1) * limit;
+
+  const { rows: countRows } = await pool.query(
+    'SELECT COUNT(*) AS total FROM transactions WHERE user_id = $1 AND type = $2',
+    [userId, 'topup']
+  );
+  const total = parseInt(countRows[0].total);
+
   const { rows } = await pool.query(`
     SELECT id, user_id AS "userId", amount, type, status, created_at AS timestamp
     FROM transactions
     WHERE user_id = $1 AND type = 'topup'
     ORDER BY created_at DESC
-  `, [userId]);
+    LIMIT $2 OFFSET $3
+  `, [userId, limit, offset]);
 
-  return rows.map(r => ({
-    ...r,
-    amount: parseFloat(r.amount)
-  }));
+  const data = rows.map(r => ({ ...r, amount: parseFloat(r.amount) }));
+
+  return { data, page, limit, total, hasMore: offset + limit < total };
 }
 
 // ─── CALLS ──────────────────────────────────────────────
@@ -211,7 +225,15 @@ async function createCallRecord(callerId, receiverId, durationSeconds, totalCost
   return rows[0];
 }
 
-async function getUserCalls(userId) {
+async function getUserCalls(userId, page = 1, limit = 20) {
+  const offset = (page - 1) * limit;
+
+  const { rows: countRows } = await pool.query(
+    'SELECT COUNT(*) AS total FROM calls WHERE caller_id = $1',
+    [userId]
+  );
+  const total = parseInt(countRows[0].total);
+
   const { rows } = await pool.query(`
     SELECT
       c.id,
@@ -225,12 +247,12 @@ async function getUserCalls(userId) {
     LEFT JOIN creators cr ON c.receiver_id = cr.user_id
     WHERE c.caller_id = $1
     ORDER BY c.created_at DESC
-  `, [userId]);
+    LIMIT $2 OFFSET $3
+  `, [userId, limit, offset]);
 
-  return rows.map(r => ({
-    ...r,
-    cost: parseFloat(r.cost)
-  }));
+  const data = rows.map(r => ({ ...r, cost: parseFloat(r.cost) }));
+
+  return { data, page, limit, total, hasMore: offset + limit < total };
 }
 
 // ─── CALL LIFECYCLE (V22) ───────────────────────────────

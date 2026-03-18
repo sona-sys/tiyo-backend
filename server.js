@@ -1,6 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 dotenv.config();
 
@@ -15,10 +18,66 @@ const notifications = require('./services/notifications');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// ─── SECURITY HEADERS (Helmet) ──────────────────────────
+app.use(helmet());
 
-// Request logging middleware
+// ─── GZIP COMPRESSION ───────────────────────────────────
+app.use(compression());
+
+// ─── CORS ────────────────────────────────────────────────
+// React Native doesn't enforce browser CORS, but this prevents
+// random websites from calling the API. Mobile requests still work.
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : ['http://localhost:8081', 'http://localhost:19006'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(null, false);
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400, // Cache preflight for 24h
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+// ─── RATE LIMITING ───────────────────────────────────────
+
+// Global: 100 req/min per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+});
+app.use('/api/', globalLimiter);
+
+// Auth: 10 req/min per IP (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many auth attempts, please try again later' },
+});
+app.use('/api/auth/', authLimiter);
+
+// Payment: 5 req/min per IP
+const paymentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many payment requests, please try again later' },
+});
+app.use('/api/payments/', paymentLimiter);
+
+// ─── REQUEST LOGGING ─────────────────────────────────────
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
@@ -42,7 +101,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ name: 'TIYO API', version: '1.0.0', status: 'running' });
+  res.json({ name: 'TIYO API', version: '1.1.0', status: 'running' });
 });
 
 // ─── AUTH ROUTES (public — no token required) ───────────
@@ -142,7 +201,9 @@ app.get('/api/users/:id/transactions', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const transactions = await db.getUserTransactions(userId);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const transactions = await db.getUserTransactions(userId, page, limit);
     res.json(transactions);
   } catch (err) {
     console.error('Get transactions error:', err);
@@ -157,7 +218,9 @@ app.get('/api/users/:id/recharges', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const recharges = await db.getUserRecharges(userId);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const recharges = await db.getUserRecharges(userId, page, limit);
     res.json(recharges);
   } catch (err) {
     console.error('Get recharges error:', err);
@@ -172,7 +235,9 @@ app.get('/api/users/:id/calls', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const calls = await db.getUserCalls(userId);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const calls = await db.getUserCalls(userId, page, limit);
     res.json(calls);
   } catch (err) {
     console.error('Get calls error:', err);
@@ -472,7 +537,9 @@ app.post('/api/users/push-token', requireAuth, async (req, res) => {
 app.get('/api/notifications', requireAuth, async (req, res) => {
   try {
     const userId = req.userId;
-    const notifs = await notifications.getUserNotifications(userId);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const notifs = await notifications.getUserNotifications(userId, page, limit);
     const unreadCount = await notifications.getUnreadCount(userId);
     res.json({ notifications: notifs, unreadCount });
   } catch (err) {

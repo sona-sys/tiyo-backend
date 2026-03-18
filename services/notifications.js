@@ -92,14 +92,16 @@ async function sendCallEndSummary(userId, creatorName, durationSeconds, cost) {
 
 // ─── Notification Queries ────────────────────────────────
 
-async function getUserNotifications(userId, limit = 50) {
+async function getUserNotifications(userId, page = 1, limit = 20) {
+  const offset = (page - 1) * limit;
+
   const { rows } = await pool.query(`
     SELECT id, title, body, type, data, read, created_at
     FROM notifications
     WHERE user_id = $1
     ORDER BY created_at DESC
-    LIMIT $2
-  `, [userId, limit]);
+    LIMIT $2 OFFSET $3
+  `, [userId, limit, offset]);
   return rows;
 }
 
