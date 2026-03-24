@@ -1,108 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const helmet = require('helmet');
-const compression = require('compression');
-const rateLimit = require('express-rate-limit');
 
 dotenv.config();
 
-const pool = require('./db/pool');
 const db = require('./db/queries');
 const { generateToken, requireAuth } = require('./middleware/auth');
 const { sendOTP, verifyOTP } = require('./auth/supabase');
 const { RAZORPAY_KEY_ID, createOrder, verifyPaymentSignature } = require('./payments/razorpay');
 const { AGORA_APP_ID, isMockMode: agoraMockMode, generateRtcToken, generateChannelName } = require('./calling/agora');
-const notifications = require('./services/notifications');
+const { sendCallNotificationToCreator } = require('./services/notifications');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── SECURITY HEADERS (Helmet) ──────────────────────────
-app.use(helmet());
-
-// ─── GZIP COMPRESSION ───────────────────────────────────
-app.use(compression());
-
-// ─── CORS ────────────────────────────────────────────────
-// React Native doesn't enforce browser CORS, but this prevents
-// random websites from calling the API. Mobile requests still work.
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',')
-  : ['http://localhost:8081', 'http://localhost:19006'];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, Postman, curl, server-to-server)
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    callback(null, false);
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400, // Cache preflight for 24h
-}));
-
-app.use(express.json({ limit: '1mb' }));
-
-// ─── RATE LIMITING ───────────────────────────────────────
-
-// Global: 100 req/min per IP
-const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later' },
-});
-app.use('/api/', globalLimiter);
-
-// Auth: 10 req/min per IP (brute-force protection)
-const authLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many auth attempts, please try again later' },
-});
-app.use('/api/auth/', authLimiter);
-
-// Payment: 5 req/min per IP
-const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many payment requests, please try again later' },
-});
-app.use('/api/payments/', paymentLimiter);
-
-// ─── REQUEST LOGGING ─────────────────────────────────────
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    if (req.path !== '/api/health') {
-      console.log(`${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
-    }
-  });
-  next();
-});
-
-// ─── HEALTH CHECK ───────────────────────────────────────
-
-app.get('/api/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() });
-  } catch (err) {
-    res.status(503).json({ status: 'unhealthy', error: 'Database unreachable' });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.json({ name: 'TIYO API', version: '1.1.0', status: 'running' });
-});
+app.use(cors());
+app.use(express.json());
 
 // ─── AUTH ROUTES (public — no token required) ───────────
 
@@ -111,13 +24,7 @@ app.post('/api/auth/login', async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
 
-    // Validate phone: strip non-digits, check length (10-15 digits)
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    if (cleanPhone.length < 10 || cleanPhone.length > 15) {
-      return res.status(400).json({ error: 'Phone number must be 10-15 digits' });
-    }
-
-    await sendOTP(cleanPhone);
+    await sendOTP(phone);
     res.json({ success: true, message: 'OTP sent successfully' });
   } catch (err) {
     console.error('OTP send error:', err.message);
@@ -132,23 +39,11 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Phone and OTP are required' });
     }
 
-    // Validate phone: strip non-digits, check length (10-15 digits)
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    if (cleanPhone.length < 10 || cleanPhone.length > 15) {
-      return res.status(400).json({ error: 'Phone number must be 10-15 digits' });
-    }
-
-    // Validate OTP: must be 4-6 digits
-    const cleanOtp = String(otp).replace(/\D/g, '');
-    if (cleanOtp.length < 4 || cleanOtp.length > 6) {
-      return res.status(400).json({ error: 'OTP must be 4-6 digits' });
-    }
-
     // Verify OTP (real Supabase or mock depending on config)
-    await verifyOTP(cleanPhone, cleanOtp);
+    await verifyOTP(phone, otp);
 
     // Find or create user in our database
-    let user = await db.findUserByPhone(cleanPhone);
+    let user = await db.findUserByPhone(phone);
     if (!user) {
       user = await db.createUser(phone);
     } else {
@@ -194,49 +89,6 @@ app.get('/api/users/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Update user profile (name, avatar)
-app.put('/api/users/profile', requireAuth, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { name, avatar } = req.body;
-
-    if (!name && !avatar) {
-      return res.status(400).json({ error: 'Nothing to update' });
-    }
-
-    // Build dynamic update
-    const updates = [];
-    const values = [];
-    let paramIndex = 1;
-
-    if (name !== undefined) {
-      const trimmed = String(name).trim().substring(0, 50);
-      if (!trimmed) return res.status(400).json({ error: 'Name cannot be empty' });
-      updates.push(`name = $${paramIndex++}`);
-      values.push(trimmed);
-    }
-
-    if (avatar !== undefined) {
-      // avatar can be a base64 string or null (to remove)
-      updates.push(`avatar = $${paramIndex++}`);
-      values.push(avatar);
-    }
-
-    values.push(userId);
-    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
-    const { rows } = await pool.query(query, values);
-
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-
-    // Get full user with balance
-    const fullUser = await db.findUserById(userId);
-    res.json({ success: true, user: formatUserForClient(fullUser) });
-  } catch (err) {
-    console.error('Update profile error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 app.get('/api/users/:id/transactions', requireAuth, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
@@ -244,9 +96,7 @@ app.get('/api/users/:id/transactions', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
-    const transactions = await db.getUserTransactions(userId, page, limit);
+    const transactions = await db.getUserTransactions(userId);
     res.json(transactions);
   } catch (err) {
     console.error('Get transactions error:', err);
@@ -261,9 +111,7 @@ app.get('/api/users/:id/recharges', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
-    const recharges = await db.getUserRecharges(userId, page, limit);
+    const recharges = await db.getUserRecharges(userId);
     res.json(recharges);
   } catch (err) {
     console.error('Get recharges error:', err);
@@ -278,12 +126,44 @@ app.get('/api/users/:id/calls', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
-    const calls = await db.getUserCalls(userId, page, limit);
+    const calls = await db.getUserCalls(userId);
     res.json(calls);
   } catch (err) {
     console.error('Get calls error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── PUSH TOKEN ROUTE ──────────────────────────────────
+
+app.post('/api/users/push-token', requireAuth, async (req, res) => {
+  try {
+    const { pushToken } = req.body;
+    if (!pushToken) return res.status(400).json({ error: 'pushToken is required' });
+
+    await db.savePushToken(req.userId, pushToken);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Save push token error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── USER PROFILE UPDATE ───────────────────────────────
+
+app.put('/api/users/profile', requireAuth, async (req, res) => {
+  try {
+    const { name, avatar } = req.body;
+    const userId = req.userId;
+
+    if (name !== undefined) {
+      await db.updateUserName(userId, name);
+    }
+
+    const user = await db.findUserById(userId);
+    res.json({ success: true, user: formatUserForClient(user) });
+  } catch (err) {
+    console.error('Update profile error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -300,6 +180,110 @@ app.get('/api/creators', async (req, res) => {
   }
 });
 
+// ─── CREATOR MANAGEMENT ROUTES (V32 — protected) ───────
+
+app.post('/api/creators/register', requireAuth, async (req, res) => {
+  try {
+    const { rate, bio, languages, categories } = req.body;
+    await db.registerCreator(req.userId, { rate, bio, languages, categories });
+
+    // Re-fetch user to get updated role
+    const user = await db.findUserById(req.userId);
+    res.json({ success: true, user: formatUserForClient(user) });
+  } catch (err) {
+    console.error('Creator register error:', err);
+    res.status(500).json({ error: 'Failed to register as creator' });
+  }
+});
+
+app.put('/api/creators/profile', requireAuth, async (req, res) => {
+  try {
+    const result = await db.updateCreatorProfile(req.userId, req.body);
+    if (!result) return res.status(404).json({ error: 'Creator not found' });
+    res.json({ success: true, creator: result });
+  } catch (err) {
+    console.error('Creator profile update error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/creators/toggle-availability', requireAuth, async (req, res) => {
+  try {
+    const result = await db.toggleCreatorAvailability(req.userId);
+    if (!result) return res.status(404).json({ error: 'Creator not found' });
+    res.json({ success: true, isOnline: result.is_online });
+  } catch (err) {
+    console.error('Toggle availability error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/dashboard', requireAuth, async (req, res) => {
+  try {
+    const dashboard = await db.getCreatorDashboard(req.userId);
+    if (!dashboard) return res.status(404).json({ error: 'Creator profile not found' });
+    res.json(dashboard);
+  } catch (err) {
+    console.error('Creator dashboard error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/incoming-calls', requireAuth, async (req, res) => {
+  try {
+    const calls = await db.getCreatorIncomingCalls(req.userId);
+    res.json(calls);
+  } catch (err) {
+    console.error('Creator incoming calls error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/calls/accept', requireAuth, async (req, res) => {
+  try {
+    const { callId } = req.body;
+    if (!callId) return res.status(400).json({ error: 'callId is required' });
+
+    // Connect the call (same as /calls/connect but from creator side)
+    const call = await db.connectCallById(callId);
+    if (!call) return res.status(404).json({ error: 'Call not found or already connected' });
+
+    // Generate Agora token for the creator
+    const tokenData = generateRtcToken(call.channel_name, req.userId);
+
+    console.log(`Call accepted by creator: ${callId}`);
+
+    res.json({
+      success: true,
+      callId: call.id,
+      channelName: call.channel_name,
+      agoraAppId: tokenData.appId,
+      agoraToken: tokenData.token,
+      agoraUid: req.userId,
+      startTime: call.start_time,
+    });
+  } catch (err) {
+    console.error('Accept call error:', err);
+    res.status(500).json({ error: 'Failed to accept call' });
+  }
+});
+
+app.post('/api/calls/reject', requireAuth, async (req, res) => {
+  try {
+    const { callId } = req.body;
+    if (!callId) return res.status(400).json({ error: 'callId is required' });
+
+    const call = await db.rejectCallById(callId);
+    if (!call) return res.status(404).json({ error: 'Call not found or already handled' });
+
+    console.log(`Call rejected by creator: ${callId}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Reject call error:', err);
+    res.status(500).json({ error: 'Failed to reject call' });
+  }
+});
+
 // ─── WALLET ROUTES (protected) ──────────────────────────
 
 app.post('/api/wallet/topup', requireAuth, async (req, res) => {
@@ -307,20 +291,11 @@ app.post('/api/wallet/topup', requireAuth, async (req, res) => {
     const { amount } = req.body;
     const userId = req.userId; // from JWT — tamper-proof
 
-    // Validate amount: positive number, max 50000
-    const numAmount = parseFloat(amount);
-    if (!Number.isFinite(numAmount) || numAmount <= 0) {
-      return res.status(400).json({ error: 'Amount must be a positive number' });
-    }
-    if (numAmount > 50000) {
-      return res.status(400).json({ error: 'Amount cannot exceed 50000' });
-    }
-
     const user = await db.findUserById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const newBalance = await db.updateWalletBalance(userId, numAmount);
-    await db.createTransaction(userId, numAmount, 'topup', 'success');
+    const newBalance = await db.updateWalletBalance(userId, amount);
+    await db.createTransaction(userId, amount, 'topup', 'success');
 
     res.json({ success: true, newBalance });
   } catch (err) {
@@ -354,19 +329,14 @@ app.post('/api/payments/create-order', requireAuth, async (req, res) => {
     const { amount } = req.body;
     const userId = req.userId;
 
-    // Validate amount: positive number, max 50000
-    const numAmount = parseFloat(amount);
-    if (!Number.isFinite(numAmount) || numAmount <= 0) {
-      return res.status(400).json({ error: 'Amount must be a positive number' });
-    }
-    if (numAmount > 50000) {
-      return res.status(400).json({ error: 'Amount cannot exceed 50000' });
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
     }
 
-    const order = await createOrder(numAmount);
+    const order = await createOrder(amount);
 
     // Log a pending transaction so we can track abandoned payments
-    await db.createTransaction(userId, numAmount, 'topup', 'pending');
+    await db.createTransaction(userId, amount, 'topup', 'pending');
 
     res.json({
       success: true,
@@ -405,11 +375,6 @@ app.post('/api/payments/verify', requireAuth, async (req, res) => {
 
     console.log(`Payment verified: user ${userId}, ₹${amount}, balance now ₹${newBalance}`);
 
-    // V23: Send payment confirmation push notification
-    notifications.sendPaymentConfirmation(userId, amount).catch(err =>
-      console.error('Payment notification failed:', err)
-    );
-
     res.json({
       success: true,
       newBalance,
@@ -444,11 +409,10 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 
     console.log(`Call started: ${call.id} (${callType || 'voice'}) channel=${channelName}`);
 
-    // V23: Notify creator of incoming call
+    // Send push notification to the creator (non-blocking)
     const caller = await db.findUserById(callerId);
-    notifications.sendCallNotification(receiverId, caller?.name || 'Someone').catch(err =>
-      console.error('Call notification failed:', err)
-    );
+    sendCallNotificationToCreator(receiverId, caller?.name, call.id, channelName)
+      .catch(err => console.error('Failed to notify creator:', err.message));
 
     res.json({
       success: true,
@@ -521,19 +485,6 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
       if (result.error) {
         return res.status(400).json({ error: result.error });
       }
-
-      // V23: Send call summary notification
-      if (result.success && !result.missed) {
-        const call = await db.getCallById(callId);
-        if (call) {
-          const creator = await db.findUserById(call.receiver_id);
-          notifications.sendCallEndSummary(
-            call.caller_id, creator?.name || 'Creator',
-            result.duration || 0, result.cost || 0
-          ).catch(err => console.error('Call summary notification failed:', err));
-        }
-      }
-
       return res.json(result);
     }
 
@@ -554,78 +505,10 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
   }
 });
 
-// ─── PUSH TOKEN ROUTE (V23) ─────────────────────────────
+// ─── HEALTH CHECK ───────────────────────────────────────
 
-app.post('/api/users/push-token', requireAuth, async (req, res) => {
-  try {
-    const { pushToken } = req.body;
-    const userId = req.userId;
-
-    if (!pushToken) {
-      return res.status(400).json({ error: 'pushToken is required' });
-    }
-
-    await pool.query('UPDATE users SET push_token = $1 WHERE id = $2', [pushToken, userId]);
-    console.log(`Push token registered for user ${userId}`);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Push token error:', err);
-    res.status(500).json({ error: 'Failed to register push token' });
-  }
-});
-
-// ─── NOTIFICATION ROUTES (V23) ──────────────────────────
-
-app.get('/api/notifications', requireAuth, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
-    const notifs = await notifications.getUserNotifications(userId, page, limit);
-    const unreadCount = await notifications.getUnreadCount(userId);
-    res.json({ notifications: notifs, unreadCount });
-  } catch (err) {
-    console.error('Get notifications error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
-  try {
-    const notifId = parseInt(req.params.id);
-    await notifications.markNotificationRead(notifId, req.userId);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Mark read error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
-  try {
-    await notifications.markAllNotificationsRead(req.userId);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Mark all read error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ─── CREATOR PRESENCE ROUTE (V23) ───────────────────────
-
-app.post('/api/creators/heartbeat', requireAuth, async (req, res) => {
-  try {
-    const userId = req.userId;
-    await pool.query(
-      'UPDATE creators SET last_seen = NOW(), is_online = TRUE WHERE user_id = $1',
-      [userId]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Heartbeat error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
+app.get('/', (req, res) => {
+  res.send('Pay-to-Call API is running');
 });
 
 // ─── HELPERS ────────────────────────────────────────────
@@ -635,24 +518,11 @@ function formatUserForClient(user) {
     id: user.id,
     name: user.name || null,
     phone: user.phone,
-    role: user.role,
+    role: user.role || 'user',
     balance: user.balance != null ? parseFloat(user.balance) : 0,
-    avatar: user.avatar || null,
+    bio: user.bio || null,
   };
 }
-
-// ─── MIDDLEWARE: 404 & ERROR HANDLING ───────────────────
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
 
 // ─── ERROR HANDLING ─────────────────────────────────────
 

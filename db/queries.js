@@ -60,7 +60,7 @@ async function getCreators() {
     SELECT
       u.id, u.name, u.role, u.bio,
       c.rate, c.languages, c.categories, c.image_color AS "imageColor",
-      c.avatar_url, c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
+      c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
     WHERE u.role = 'creator'
@@ -74,7 +74,7 @@ async function getCreatorById(id) {
     SELECT
       u.id, u.name, u.role, u.bio,
       c.rate, c.languages, c.categories, c.image_color AS "imageColor",
-      c.avatar_url, c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
+      c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
     WHERE u.id = $1
@@ -113,9 +113,7 @@ async function createTransaction(userId, amount, type, status = 'success') {
   return rows[0];
 }
 
-async function getUserTransactions(userId, page = 1, limit = 20) {
-  const offset = (page - 1) * limit;
-
+async function getUserTransactions(userId) {
   // Get top-up transactions
   const { rows: topups } = await pool.query(`
     SELECT id, amount, type, status, created_at AS timestamp
@@ -185,33 +183,21 @@ async function getUserTransactions(userId, page = 1, limit = 20) {
   const combined = [...topupEntries, ...callEntries, initialEntry]
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-  // Paginate the combined result
-  const total = combined.length;
-  const paginated = combined.slice(offset, offset + limit);
-
-  return { data: paginated, page, limit, total, hasMore: offset + limit < total };
+  return combined;
 }
 
-async function getUserRecharges(userId, page = 1, limit = 20) {
-  const offset = (page - 1) * limit;
-
-  const { rows: countRows } = await pool.query(
-    'SELECT COUNT(*) AS total FROM transactions WHERE user_id = $1 AND type = $2',
-    [userId, 'topup']
-  );
-  const total = parseInt(countRows[0].total);
-
+async function getUserRecharges(userId) {
   const { rows } = await pool.query(`
     SELECT id, user_id AS "userId", amount, type, status, created_at AS timestamp
     FROM transactions
     WHERE user_id = $1 AND type = 'topup'
     ORDER BY created_at DESC
-    LIMIT $2 OFFSET $3
-  `, [userId, limit, offset]);
+  `, [userId]);
 
-  const data = rows.map(r => ({ ...r, amount: parseFloat(r.amount) }));
-
-  return { data, page, limit, total, hasMore: offset + limit < total };
+  return rows.map(r => ({
+    ...r,
+    amount: parseFloat(r.amount)
+  }));
 }
 
 // ─── CALLS ──────────────────────────────────────────────
@@ -225,21 +211,12 @@ async function createCallRecord(callerId, receiverId, durationSeconds, totalCost
   return rows[0];
 }
 
-async function getUserCalls(userId, page = 1, limit = 20) {
-  const offset = (page - 1) * limit;
-
-  const { rows: countRows } = await pool.query(
-    'SELECT COUNT(*) AS total FROM calls WHERE caller_id = $1',
-    [userId]
-  );
-  const total = parseInt(countRows[0].total);
-
+async function getUserCalls(userId) {
   const { rows } = await pool.query(`
     SELECT
       c.id,
       u.name AS "creatorName",
       cr.image_color AS "creatorColor",
-      cr.avatar_url AS "creatorAvatarUrl",
       c.duration_seconds AS "durationSeconds",
       c.total_cost AS cost,
       c.created_at AS timestamp
@@ -248,12 +225,12 @@ async function getUserCalls(userId, page = 1, limit = 20) {
     LEFT JOIN creators cr ON c.receiver_id = cr.user_id
     WHERE c.caller_id = $1
     ORDER BY c.created_at DESC
-    LIMIT $2 OFFSET $3
-  `, [userId, limit, offset]);
+  `, [userId]);
 
-  const data = rows.map(r => ({ ...r, cost: parseFloat(r.cost) }));
-
-  return { data, page, limit, total, hasMore: offset + limit < total };
+  return rows.map(r => ({
+    ...r,
+    cost: parseFloat(r.cost)
+  }));
 }
 
 // ─── CALL LIFECYCLE (V22) ───────────────────────────────
@@ -429,6 +406,152 @@ async function processCallEnd(callerId, receiverId, durationSeconds) {
   }
 }
 
+// ─── PUSH TOKENS ───────────────────────────────────────
+
+async function savePushToken(userId, pushToken) {
+  const { rows } = await pool.query(
+    'UPDATE users SET push_token = $1 WHERE id = $2 RETURNING id',
+    [pushToken, userId]
+  );
+  return rows[0] || null;
+}
+
+// ─── CREATOR REGISTRATION & MANAGEMENT (V32) ──────────
+
+async function registerCreator(userId, { rate, bio, languages, categories }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Update user role to 'creator'
+    await client.query(
+      "UPDATE users SET role = 'creator', bio = $1 WHERE id = $2",
+      [bio || null, userId]
+    );
+
+    // Insert into creators table
+    await client.query(`
+      INSERT INTO creators (user_id, rate, languages, categories, is_online)
+      VALUES ($1, $2, $3, $4, false)
+      ON CONFLICT (user_id) DO UPDATE SET
+        rate = EXCLUDED.rate,
+        languages = EXCLUDED.languages,
+        categories = EXCLUDED.categories
+    `, [userId, rate || 10, languages || 'Hindi, English', categories || ['General']]);
+
+    // Ensure creator has a wallet (they should already, but just in case)
+    await client.query(`
+      INSERT INTO wallets (user_id, balance) VALUES ($1, 0)
+      ON CONFLICT (user_id) DO NOTHING
+    `, [userId]);
+
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateCreatorProfile(userId, updates) {
+  const fields = [];
+  const values = [];
+  let idx = 1;
+
+  if (updates.rate !== undefined) { fields.push(`rate = $${idx++}`); values.push(updates.rate); }
+  if (updates.languages !== undefined) { fields.push(`languages = $${idx++}`); values.push(updates.languages); }
+  if (updates.categories !== undefined) { fields.push(`categories = $${idx++}`); values.push(updates.categories); }
+  if (updates.is_online !== undefined) { fields.push(`is_online = $${idx++}`); values.push(updates.is_online); }
+
+  if (fields.length === 0) return null;
+
+  values.push(userId);
+  const { rows } = await pool.query(
+    `UPDATE creators SET ${fields.join(', ')} WHERE user_id = $${idx} RETURNING *`,
+    values
+  );
+
+  // Also update bio on users table if provided
+  if (updates.bio !== undefined) {
+    await pool.query('UPDATE users SET bio = $1 WHERE id = $2', [updates.bio, userId]);
+  }
+
+  return rows[0] || null;
+}
+
+async function toggleCreatorAvailability(userId) {
+  const { rows } = await pool.query(`
+    UPDATE creators SET is_online = NOT is_online, last_seen = NOW()
+    WHERE user_id = $1
+    RETURNING is_online
+  `, [userId]);
+  return rows[0] || null;
+}
+
+async function getCreatorDashboard(userId) {
+  // Get creator stats
+  const { rows: creatorRows } = await pool.query(`
+    SELECT c.rate, c.is_online, c.rating, c.total_calls, c.total_earnings,
+           c.languages, c.categories,
+           u.name, u.bio, u.phone
+    FROM creators c
+    JOIN users u ON c.user_id = u.id
+    WHERE c.user_id = $1
+  `, [userId]);
+
+  if (!creatorRows[0]) return null;
+
+  // Get wallet balance
+  const { rows: walletRows } = await pool.query(
+    'SELECT balance FROM wallets WHERE user_id = $1',
+    [userId]
+  );
+
+  // Get recent calls received
+  const { rows: recentCalls } = await pool.query(`
+    SELECT c.id, c.duration_seconds, c.total_cost, c.status, c.created_at,
+           u.name AS caller_name
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = $1
+    ORDER BY c.created_at DESC
+    LIMIT 10
+  `, [userId]);
+
+  return {
+    ...creatorRows[0],
+    balance: walletRows[0] ? parseFloat(walletRows[0].balance) : 0,
+    total_earnings: parseFloat(creatorRows[0].total_earnings),
+    recentCalls: recentCalls.map(c => ({
+      ...c,
+      total_cost: c.total_cost ? parseFloat(c.total_cost) : 0,
+    })),
+  };
+}
+
+async function getCreatorIncomingCalls(userId) {
+  const { rows } = await pool.query(`
+    SELECT c.id, c.caller_id, c.channel_name, c.call_type, c.status, c.created_at,
+           u.name AS caller_name
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = $1 AND c.status = 'ringing'
+    ORDER BY c.created_at DESC
+  `, [userId]);
+  return rows;
+}
+
+async function rejectCallById(callId) {
+  const { rows } = await pool.query(`
+    UPDATE calls SET status = 'rejected', end_time = NOW()
+    WHERE id = $1 AND status = 'ringing'
+    RETURNING *
+  `, [callId]);
+  return rows[0] || null;
+}
+
 module.exports = {
   findUserByPhone,
   findUserById,
@@ -448,4 +571,12 @@ module.exports = {
   connectCallById,
   getCallById,
   processCallEndById,
+  // V32 — Creator Mode
+  savePushToken,
+  registerCreator,
+  updateCreatorProfile,
+  toggleCreatorAvailability,
+  getCreatorDashboard,
+  getCreatorIncomingCalls,
+  rejectCallById,
 };
