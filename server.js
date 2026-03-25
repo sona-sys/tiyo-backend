@@ -429,7 +429,7 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 
     // Send push notification to the creator (non-blocking)
     const caller = await db.findUserById(callerId);
-    sendCallNotificationToCreator(receiverId, caller?.name, call.id, channelName)
+    sendCallNotificationToCreator(receiverId, caller?.name, call.id, channelName, callType || 'voice')
       .catch(err => console.error('Failed to notify creator:', err.message));
 
     res.json({
