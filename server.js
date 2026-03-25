@@ -154,6 +154,19 @@ app.post('/api/users/push-token', requireAuth, async (req, res) => {
   }
 });
 
+// ─── NOTIFICATIONS ROUTE ─────────────────────────────
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    // V35: stub — returns empty list + unread count for now
+    // Full notification system (DB-backed) can be added later
+    res.json({ notifications: [], unreadCount: 0 });
+  } catch (err) {
+    console.error('Notifications error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── USER PROFILE UPDATE ───────────────────────────────
 
 app.put('/api/users/profile', requireAuth, async (req, res) => {
