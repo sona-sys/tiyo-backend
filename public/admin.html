@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TIYO Admin Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            dark: { 900: '#121212', 800: '#1e1e1e', 700: '#2c2c2e', 600: '#3a3a3c' },
+            accent: '#BB86FC',
+            teal: '#03DAC6',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .tab-btn.active { background: #BB86FC; color: #121212; }
+    .fade-in { animation: fadeIn 0.3s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    table { border-collapse: collapse; width: 100%; }
+    th { position: sticky; top: 0; z-index: 1; }
+  </style>
+</head>
+<body class="bg-dark-900 text-gray-200 min-h-screen">
+
+  <!-- Login Screen -->
+  <div id="loginScreen" class="flex items-center justify-center min-h-screen">
+    <div class="bg-dark-800 p-8 rounded-2xl border border-dark-700 w-full max-w-sm">
+      <h1 class="text-2xl font-bold text-accent mb-2">TIYO Admin</h1>
+      <p class="text-gray-500 text-sm mb-6">Enter your admin password to continue</p>
+      <input id="passwordInput" type="password" placeholder="Admin password"
+        class="w-full bg-dark-900 border border-dark-600 rounded-xl px-4 py-3 text-white mb-4 focus:outline-none focus:border-accent">
+      <button onclick="doLogin()"
+        class="w-full bg-accent text-dark-900 font-bold py-3 rounded-xl hover:opacity-90 transition">
+        Sign In
+      </button>
+      <p id="loginError" class="text-red-400 text-sm mt-3 hidden">Invalid password</p>
+    </div>
+  </div>
+
+  <!-- Dashboard (hidden until login) -->
+  <div id="dashboard" class="hidden">
+    <!-- Header -->
+    <header class="bg-dark-800 border-b border-dark-700 px-6 py-4 flex items-center justify-between sticky top-0 z-10">
+      <div class="flex items-center gap-3">
+        <h1 class="text-xl font-bold text-accent">TIYO</h1>
+        <span class="text-gray-500 text-sm">Admin Dashboard</span>
+      </div>
+      <button onclick="refreshAll()" class="text-sm text-gray-400 hover:text-accent transition">Refresh</button>
+    </header>
+
+    <!-- Stats Cards -->
+    <div id="statsSection" class="p-6">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="statsGrid">
+        <!-- Filled by JS -->
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="px-6 flex gap-2 mb-4 overflow-x-auto">
+      <button class="tab-btn active px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('users')">Users</button>
+      <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('creators')">Creators</button>
+      <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('calls')">Calls</button>
+      <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('transactions')">Transactions</button>
+    </div>
+
+    <!-- Tab Content -->
+    <div class="px-6 pb-12">
+      <div class="bg-dark-800 rounded-2xl border border-dark-700 overflow-hidden">
+        <div id="tableContainer" class="overflow-x-auto max-h-[60vh] overflow-y-auto">
+          <!-- Filled by JS -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  let adminKey = '';
+  const BASE = window.location.origin;
+
+  // ─── Auth ─────────────────────────────────────────────
+  function doLogin() {
+    adminKey = document.getElementById('passwordInput').value.trim();
+    if (!adminKey) return;
+    // Test the key by hitting stats endpoint
+    fetch(BASE + '/api/admin/stats?key=' + encodeURIComponent(adminKey))
+      .then(r => {
+        if (!r.ok) throw new Error('bad key');
+        return r.json();
+      })
+      .then(() => {
+        document.getElementById('loginScreen').classList.add('hidden');
+        document.getElementById('dashboard').classList.remove('hidden');
+        refreshAll();
+      })
+      .catch(() => {
+        document.getElementById('loginError').classList.remove('hidden');
+      });
+  }
+
+  document.getElementById('passwordInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+  });
+
+  // ─── API helpers ──────────────────────────────────────
+  function api(endpoint) {
+    return fetch(BASE + endpoint + (endpoint.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(adminKey))
+      .then(r => r.json());
+  }
+
+  // ─── Stats ────────────────────────────────────────────
+  function renderStats(stats) {
+    const cards = [
+      { label: 'Total Users', value: stats.totalUsers, color: 'text-white' },
+      { label: 'Total Creators', value: stats.totalCreators, color: 'text-accent' },
+      { label: 'Total Calls', value: stats.totalCalls, color: 'text-teal' },
+      { label: 'Completed Calls', value: stats.completedCalls, color: 'text-green-400' },
+      { label: 'Total Revenue', value: '₹' + stats.totalRevenue.toFixed(0), color: 'text-yellow-400' },
+      { label: 'Total Recharges', value: '₹' + stats.totalRecharges.toFixed(0), color: 'text-blue-400' },
+      { label: 'New Users (7d)', value: stats.newUsers7d, color: 'text-purple-400' },
+      { label: 'Calls (7d)', value: stats.calls7d, color: 'text-pink-400' },
+    ];
+    document.getElementById('statsGrid').innerHTML = cards.map(c => `
+      <div class="bg-dark-800 border border-dark-700 rounded-xl p-4">
+        <div class="${c.color} text-2xl font-bold">${c.value}</div>
+        <div class="text-gray-500 text-xs mt-1">${c.label}</div>
+      </div>
+    `).join('');
+  }
+
+  // ─── Tables ───────────────────────────────────────────
+  let currentTab = 'users';
+
+  function switchTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    loadTab(tab);
+  }
+
+  function loadTab(tab) {
+    document.getElementById('tableContainer').innerHTML =
+      '<div class="p-8 text-center text-gray-500">Loading...</div>';
+
+    switch (tab) {
+      case 'users': return api('/api/admin/users?limit=100').then(renderUsersTable);
+      case 'creators': return api('/api/admin/creators').then(renderCreatorsTable);
+      case 'calls': return api('/api/admin/calls?limit=100').then(renderCallsTable);
+      case 'transactions': return api('/api/admin/transactions?limit=100').then(renderTransactionsTable);
+    }
+  }
+
+  function fmtDate(d) {
+    if (!d) return '—';
+    const dt = new Date(d);
+    return dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) + ' ' +
+           dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function fmtDuration(s) {
+    if (!s) return '—';
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return m + ':' + String(sec).padStart(2, '0');
+  }
+
+  function statusBadge(status) {
+    const colors = {
+      completed: 'bg-green-900 text-green-300',
+      initiated: 'bg-yellow-900 text-yellow-300',
+      ringing: 'bg-blue-900 text-blue-300',
+      connected: 'bg-teal text-dark-900',
+      rejected: 'bg-red-900 text-red-300',
+      missed: 'bg-orange-900 text-orange-300',
+      success: 'bg-green-900 text-green-300',
+      failed: 'bg-red-900 text-red-300',
+      pending: 'bg-yellow-900 text-yellow-300',
+    };
+    const cls = colors[status] || 'bg-dark-700 text-gray-400';
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + cls + '">' + (status || '—') + '</span>';
+  }
+
+  function renderUsersTable(users) {
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Name</th><th class="px-4 py-3">Phone</th>';
+    html += '<th class="px-4 py-3">Role</th><th class="px-4 py-3">Balance</th><th class="px-4 py-3">Joined</th></tr></thead><tbody>';
+    users.forEach(u => {
+      const roleBadge = u.role === 'creator'
+        ? '<span class="bg-accent text-dark-900 px-2 py-0.5 rounded-full text-xs font-medium">creator</span>'
+        : '<span class="text-gray-500 text-xs">user</span>';
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + u.id + '</td>';
+      html += '<td class="px-4 py-3 text-sm font-medium">' + (u.name || '<span class=text-gray-600>—</span>') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + u.phone + '</td>';
+      html += '<td class="px-4 py-3">' + roleBadge + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-green-400">₹' + u.balance.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(u.created_at) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function renderCreatorsTable(creators) {
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">Name</th><th class="px-4 py-3">Status</th>';
+    html += '<th class="px-4 py-3">Voice Rate</th><th class="px-4 py-3">Video Rate</th>';
+    html += '<th class="px-4 py-3">Rating</th><th class="px-4 py-3">Calls</th>';
+    html += '<th class="px-4 py-3">Earnings</th><th class="px-4 py-3">Balance</th></tr></thead><tbody>';
+    creators.forEach(c => {
+      const status = c.is_online
+        ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1"></span>Online'
+        : '<span class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1"></span>Offline';
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm font-medium">' + (c.name || '—') + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + status + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-accent">₹' + c.rate + '/min</td>';
+      html += '<td class="px-4 py-3 text-sm text-teal">₹' + c.video_rate + '/min</td>';
+      html += '<td class="px-4 py-3 text-sm text-yellow-400">⭐ ' + c.rating.toFixed(1) + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + c.total_calls + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-green-400">₹' + c.total_earnings.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm">₹' + c.balance.toFixed(0) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function renderCallsTable(calls) {
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Caller</th><th class="px-4 py-3">Creator</th>';
+    html += '<th class="px-4 py-3">Type</th><th class="px-4 py-3">Status</th>';
+    html += '<th class="px-4 py-3">Duration</th><th class="px-4 py-3">Cost</th>';
+    html += '<th class="px-4 py-3">Date</th></tr></thead><tbody>';
+    calls.forEach(c => {
+      const typeBadge = c.call_type === 'video'
+        ? '<span class="text-teal text-xs font-medium">Video</span>'
+        : '<span class="text-accent text-xs font-medium">Voice</span>';
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + c.id + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + (c.caller_name || c.caller_phone || '—') + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + (c.receiver_name || c.receiver_phone || '—') + '</td>';
+      html += '<td class="px-4 py-3">' + typeBadge + '</td>';
+      html += '<td class="px-4 py-3">' + statusBadge(c.status) + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + fmtDuration(c.duration_seconds) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-green-400">' + (c.total_cost > 0 ? '₹' + c.total_cost.toFixed(0) : '—') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(c.created_at) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function renderTransactionsTable(txns) {
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">User</th>';
+    html += '<th class="px-4 py-3">Amount</th><th class="px-4 py-3">Type</th>';
+    html += '<th class="px-4 py-3">Status</th><th class="px-4 py-3">Date</th></tr></thead><tbody>';
+    txns.forEach(t => {
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + t.id + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + (t.user_name || t.user_phone || '—') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-green-400">₹' + t.amount.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + t.type + '</td>';
+      html += '<td class="px-4 py-3">' + statusBadge(t.status) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(t.created_at) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  // ─── Refresh all data ─────────────────────────────────
+  function refreshAll() {
+    api('/api/admin/stats').then(renderStats);
+    loadTab(currentTab);
+  }
+</script>
+</body>
+</html>

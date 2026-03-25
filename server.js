@@ -10,12 +10,17 @@ const { sendOTP, verifyOTP } = require('./auth/supabase');
 const { RAZORPAY_KEY_ID, createOrder, verifyPaymentSignature } = require('./payments/razorpay');
 const { AGORA_APP_ID, isMockMode: agoraMockMode, generateRtcToken, generateChannelName } = require('./calling/agora');
 const { sendCallNotificationToCreator } = require('./services/notifications');
+const { requireAdmin } = require('./middleware/adminAuth');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// Serve static files (admin dashboard)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── AUTH ROUTES (public — no token required) ───────────
 
@@ -501,6 +506,64 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'callId or (receiverId + durationSeconds) required' });
   } catch (err) {
     console.error('End call error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── ADMIN ROUTES (V34 — protected by admin key) ────────
+
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const stats = await db.adminGetStats();
+    res.json(stats);
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    const users = await db.adminGetUsers(limit, offset);
+    res.json(users);
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/creators', requireAdmin, async (req, res) => {
+  try {
+    const creators = await db.adminGetCreators();
+    res.json(creators);
+  } catch (err) {
+    console.error('Admin creators error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/calls', requireAdmin, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    const calls = await db.adminGetCalls(limit, offset);
+    res.json(calls);
+  } catch (err) {
+    console.error('Admin calls error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    const txns = await db.adminGetTransactions(limit, offset);
+    res.json(txns);
+  } catch (err) {
+    console.error('Admin transactions error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

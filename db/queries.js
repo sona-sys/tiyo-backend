@@ -559,6 +559,95 @@ async function rejectCallById(callId) {
   return rows[0] || null;
 }
 
+// ─── ADMIN QUERIES (V34) ─────────────────────────────
+
+async function adminGetStats() {
+  const { rows } = await pool.query(`
+    SELECT
+      (SELECT COUNT(*) FROM users) AS total_users,
+      (SELECT COUNT(*) FROM users WHERE role = 'creator') AS total_creators,
+      (SELECT COUNT(*) FROM calls) AS total_calls,
+      (SELECT COUNT(*) FROM calls WHERE status = 'completed') AS completed_calls,
+      (SELECT COALESCE(SUM(total_cost), 0) FROM calls WHERE status = 'completed') AS total_revenue,
+      (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type = 'topup' AND status = 'success') AS total_recharges,
+      (SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days') AS new_users_7d,
+      (SELECT COUNT(*) FROM calls WHERE created_at > NOW() - INTERVAL '7 days') AS calls_7d
+  `);
+  const stats = rows[0];
+  return {
+    totalUsers: parseInt(stats.total_users),
+    totalCreators: parseInt(stats.total_creators),
+    totalCalls: parseInt(stats.total_calls),
+    completedCalls: parseInt(stats.completed_calls),
+    totalRevenue: parseFloat(stats.total_revenue),
+    totalRecharges: parseFloat(stats.total_recharges),
+    newUsers7d: parseInt(stats.new_users_7d),
+    calls7d: parseInt(stats.calls_7d),
+  };
+}
+
+async function adminGetUsers(limit = 50, offset = 0) {
+  const { rows } = await pool.query(`
+    SELECT u.id, u.name, u.phone, u.role, u.bio, u.created_at,
+           COALESCE(w.balance, 0) AS balance
+    FROM users u
+    LEFT JOIN wallets w ON u.id = w.user_id
+    ORDER BY u.id DESC
+    LIMIT $1 OFFSET $2
+  `, [limit, offset]);
+  return rows.map(r => ({ ...r, balance: parseFloat(r.balance) }));
+}
+
+async function adminGetCreators() {
+  const { rows } = await pool.query(`
+    SELECT u.id, u.name, u.phone, u.created_at,
+           c.rate, c.video_rate, c.languages, c.categories, c.is_online,
+           c.rating, c.total_calls, c.total_earnings,
+           COALESCE(w.balance, 0) AS balance
+    FROM creators c
+    JOIN users u ON c.user_id = u.id
+    LEFT JOIN wallets w ON u.id = w.user_id
+    ORDER BY c.total_earnings DESC
+  `);
+  return rows.map(r => ({
+    ...r,
+    rate: parseFloat(r.rate),
+    video_rate: parseFloat(r.video_rate),
+    total_earnings: parseFloat(r.total_earnings),
+    balance: parseFloat(r.balance),
+    rating: parseFloat(r.rating),
+  }));
+}
+
+async function adminGetCalls(limit = 50, offset = 0) {
+  const { rows } = await pool.query(`
+    SELECT c.id, c.call_type, c.status, c.duration_seconds, c.total_cost, c.created_at,
+           caller.name AS caller_name, caller.phone AS caller_phone,
+           receiver.name AS receiver_name, receiver.phone AS receiver_phone
+    FROM calls c
+    LEFT JOIN users caller ON c.caller_id = caller.id
+    LEFT JOIN users receiver ON c.receiver_id = receiver.id
+    ORDER BY c.created_at DESC
+    LIMIT $1 OFFSET $2
+  `, [limit, offset]);
+  return rows.map(r => ({
+    ...r,
+    total_cost: r.total_cost ? parseFloat(r.total_cost) : 0,
+  }));
+}
+
+async function adminGetTransactions(limit = 50, offset = 0) {
+  const { rows } = await pool.query(`
+    SELECT t.id, t.amount, t.type, t.status, t.created_at,
+           u.name AS user_name, u.phone AS user_phone
+    FROM transactions t
+    LEFT JOIN users u ON t.user_id = u.id
+    ORDER BY t.created_at DESC
+    LIMIT $1 OFFSET $2
+  `, [limit, offset]);
+  return rows.map(r => ({ ...r, amount: parseFloat(r.amount) }));
+}
+
 module.exports = {
   findUserByPhone,
   findUserById,
@@ -586,4 +675,10 @@ module.exports = {
   getCreatorDashboard,
   getCreatorIncomingCalls,
   rejectCallById,
+  // V34 — Admin Dashboard
+  adminGetStats,
+  adminGetUsers,
+  adminGetCreators,
+  adminGetCalls,
+  adminGetTransactions,
 };
