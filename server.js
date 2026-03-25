@@ -184,8 +184,8 @@ app.get('/api/creators', async (req, res) => {
 
 app.post('/api/creators/register', requireAuth, async (req, res) => {
   try {
-    const { rate, bio, languages, categories } = req.body;
-    await db.registerCreator(req.userId, { rate, bio, languages, categories });
+    const { rate, videoRate, bio, languages, categories } = req.body;
+    await db.registerCreator(req.userId, { rate, videoRate, bio, languages, categories });
 
     // Re-fetch user to get updated role
     const user = await db.findUserById(req.userId);

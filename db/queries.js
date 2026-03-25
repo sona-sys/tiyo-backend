@@ -59,7 +59,7 @@ async function getCreators() {
   const { rows } = await pool.query(`
     SELECT
       u.id, u.name, u.role, u.bio,
-      c.rate, c.languages, c.categories, c.image_color AS "imageColor",
+      c.rate, c.video_rate AS "videoRate", c.languages, c.categories, c.image_color AS "imageColor",
       c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
@@ -73,7 +73,7 @@ async function getCreatorById(id) {
   const { rows } = await pool.query(`
     SELECT
       u.id, u.name, u.role, u.bio,
-      c.rate, c.languages, c.categories, c.image_color AS "imageColor",
+      c.rate, c.video_rate AS "videoRate", c.languages, c.categories, c.image_color AS "imageColor",
       c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
@@ -293,11 +293,14 @@ async function processCallEndById(callId) {
     const durationSeconds = Math.max(timeRows[0].duration, 0);
 
     const { rows: creatorRows } = await client.query(
-      'SELECT rate FROM creators WHERE user_id = $1',
+      'SELECT rate, video_rate FROM creators WHERE user_id = $1',
       [call.receiver_id]
     );
     if (!creatorRows[0]) throw new Error('Creator not found');
-    const rate = parseFloat(creatorRows[0].rate);
+    // Use video_rate for video calls, voice rate otherwise
+    const rate = call.call_type === 'video'
+      ? parseFloat(creatorRows[0].video_rate || creatorRows[0].rate)
+      : parseFloat(creatorRows[0].rate);
 
     const minutes = Math.ceil(durationSeconds / 60);
     const totalCost = minutes * rate;
@@ -348,9 +351,9 @@ async function processCallEnd(callerId, receiverId, durationSeconds) {
   try {
     await client.query('BEGIN');
 
-    // Get creator rate
+    // Get creator rate (legacy path doesn't have call_type, default to voice rate)
     const { rows: creatorRows } = await client.query(
-      'SELECT rate FROM creators WHERE user_id = $1',
+      'SELECT rate, video_rate FROM creators WHERE user_id = $1',
       [receiverId]
     );
     if (!creatorRows[0]) throw new Error('Creator not found');
@@ -418,7 +421,7 @@ async function savePushToken(userId, pushToken) {
 
 // ─── CREATOR REGISTRATION & MANAGEMENT (V32) ──────────
 
-async function registerCreator(userId, { rate, bio, languages, categories }) {
+async function registerCreator(userId, { rate, videoRate, bio, languages, categories }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -429,15 +432,18 @@ async function registerCreator(userId, { rate, bio, languages, categories }) {
       [bio || null, userId]
     );
 
-    // Insert into creators table
+    // Insert into creators table with separate voice and video rates
+    const voiceRate = rate || 10;
+    const vidRate = videoRate || Math.round(voiceRate * 1.5); // default video rate is 1.5x voice
     await client.query(`
-      INSERT INTO creators (user_id, rate, languages, categories, is_online)
-      VALUES ($1, $2, $3, $4, false)
+      INSERT INTO creators (user_id, rate, video_rate, languages, categories, is_online)
+      VALUES ($1, $2, $3, $4, $5, false)
       ON CONFLICT (user_id) DO UPDATE SET
         rate = EXCLUDED.rate,
+        video_rate = EXCLUDED.video_rate,
         languages = EXCLUDED.languages,
         categories = EXCLUDED.categories
-    `, [userId, rate || 10, languages || 'Hindi, English', categories || ['General']]);
+    `, [userId, voiceRate, vidRate, languages || 'Hindi, English', categories || ['General']]);
 
     // Ensure creator has a wallet (they should already, but just in case)
     await client.query(`
@@ -461,6 +467,7 @@ async function updateCreatorProfile(userId, updates) {
   let idx = 1;
 
   if (updates.rate !== undefined) { fields.push(`rate = $${idx++}`); values.push(updates.rate); }
+  if (updates.videoRate !== undefined) { fields.push(`video_rate = $${idx++}`); values.push(updates.videoRate); }
   if (updates.languages !== undefined) { fields.push(`languages = $${idx++}`); values.push(updates.languages); }
   if (updates.categories !== undefined) { fields.push(`categories = $${idx++}`); values.push(updates.categories); }
   if (updates.is_online !== undefined) { fields.push(`is_online = $${idx++}`); values.push(updates.is_online); }
@@ -493,7 +500,7 @@ async function toggleCreatorAvailability(userId) {
 async function getCreatorDashboard(userId) {
   // Get creator stats
   const { rows: creatorRows } = await pool.query(`
-    SELECT c.rate, c.is_online, c.rating, c.total_calls, c.total_earnings,
+    SELECT c.rate, c.video_rate, c.is_online, c.rating, c.total_calls, c.total_earnings,
            c.languages, c.categories,
            u.name, u.bio, u.phone
     FROM creators c
