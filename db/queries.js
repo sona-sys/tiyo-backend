@@ -58,12 +58,12 @@ async function updateUserName(id, name) {
 async function getCreators() {
   const { rows } = await pool.query(`
     SELECT
-      u.id, u.name, u.role, u.bio,
+      u.id, COALESCE(u.name, u.phone, 'Creator') AS name, u.role, u.bio,
       c.rate, c.video_rate AS "videoRate", c.languages, c.categories, c.image_color AS "imageColor",
       c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
-    WHERE u.role = 'creator'
+    WHERE u.role = 'creator' AND u.name IS NOT NULL AND u.name != ''
     ORDER BY u.id
   `);
   return rows;
@@ -122,7 +122,7 @@ async function getUserTransactions(userId) {
     ORDER BY created_at DESC
   `, [userId]);
 
-  // Get call deductions
+  // Get call deductions (as caller)
   const { rows: calls } = await pool.query(`
     SELECT
       c.id, c.total_cost, c.duration_seconds,
@@ -131,6 +131,18 @@ async function getUserTransactions(userId) {
     FROM calls c
     JOIN users u ON c.receiver_id = u.id
     WHERE c.caller_id = $1
+    ORDER BY c.created_at DESC
+  `, [userId]);
+
+  // Get call earnings (as creator)
+  const { rows: earnings } = await pool.query(`
+    SELECT
+      c.id, c.total_cost, c.duration_seconds,
+      u.name AS caller_name,
+      c.created_at AS timestamp
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = $1 AND c.status = 'completed' AND c.total_cost > 0
     ORDER BY c.created_at DESC
   `, [userId]);
 
@@ -152,6 +164,15 @@ async function getUserTransactions(userId) {
     type: 'call',
     amount: -parseFloat(c.total_cost),
     title: `Call with ${c.creator_name || 'Unknown'}`,
+    durationSeconds: c.duration_seconds,
+    timestamp: c.timestamp
+  }));
+
+  const earningEntries = earnings.map(c => ({
+    id: `earning_${c.id}`,
+    type: 'earning',
+    amount: parseFloat(c.total_cost),
+    title: `Earned from ${c.caller_name || 'Unknown'}`,
     durationSeconds: c.duration_seconds,
     timestamp: c.timestamp
   }));
@@ -180,7 +201,7 @@ async function getUserTransactions(userId) {
         timestamp: walletRows[0]?.created_at || new Date('2024-01-01').toISOString()
       };
 
-  const combined = [...topupEntries, ...callEntries, initialEntry]
+  const combined = [...topupEntries, ...callEntries, ...earningEntries, initialEntry]
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
   return combined;
@@ -328,6 +349,18 @@ async function processCallEndById(callId) {
       WHERE id = $3
     `, [durationSeconds, chargeAmount, callId]);
 
+    // Record transaction for caller (debit)
+    await client.query(
+      `INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'call_debit', 'success')`,
+      [call.caller_id, -chargeAmount]
+    );
+
+    // Record transaction for creator (credit / earnings)
+    await client.query(
+      `INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'call_earning', 'success')`,
+      [call.receiver_id, chargeAmount]
+    );
+
     await client.query('COMMIT');
 
     return {
@@ -437,7 +470,7 @@ async function registerCreator(userId, { rate, videoRate, bio, languages, catego
     const vidRate = videoRate || Math.round(voiceRate * 1.5); // default video rate is 1.5x voice
     await client.query(`
       INSERT INTO creators (user_id, rate, video_rate, languages, categories, is_online)
-      VALUES ($1, $2, $3, $4, $5, false)
+      VALUES ($1, $2, $3, $4, $5, true)
       ON CONFLICT (user_id) DO UPDATE SET
         rate = EXCLUDED.rate,
         video_rate = EXCLUDED.video_rate,
