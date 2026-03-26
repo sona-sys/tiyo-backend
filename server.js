@@ -29,6 +29,7 @@ app.use(helmet({
       imgSrc: ["'self'", "data:"],
       connectSrc: ["'self'"],
       fontSrc: ["'self'", "https:", "data:"],
+      scriptSrcAttr: ["'unsafe-inline'"], // Allow onclick= attributes in admin.html
     },
   },
 }));
