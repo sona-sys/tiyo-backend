@@ -42,12 +42,12 @@
         class="w-full bg-accent text-dark-900 font-bold py-3 rounded-xl hover:opacity-90 transition">
         Sign In
       </button>
-      <p id="loginError" class="text-red-400 text-sm mt-3 hidden">Invalid password</p>
+      <p id="loginError" class="text-red-400 text-sm mt-3" style="display:none">Invalid password</p>
     </div>
   </div>
 
   <!-- Dashboard (hidden until login) -->
-  <div id="dashboard" class="hidden">
+  <div id="dashboard" style="display:none">
     <!-- Header -->
     <header class="bg-dark-800 border-b border-dark-700 px-6 py-4 flex items-center justify-between sticky top-0 z-10">
       <div class="flex items-center gap-3">
@@ -90,19 +90,24 @@
   function doLogin() {
     adminKey = document.getElementById('passwordInput').value.trim();
     if (!adminKey) return;
+    var btn = document.querySelector('#loginScreen button');
+    btn.textContent = 'Signing in...';
+    btn.disabled = true;
     // Test the key by hitting stats endpoint
     fetch(BASE + '/api/admin/stats', { headers: { 'x-admin-key': adminKey } })
-      .then(r => {
+      .then(function(r) {
         if (!r.ok) throw new Error('bad key');
         return r.json();
       })
-      .then(() => {
-        document.getElementById('loginScreen').classList.add('hidden');
-        document.getElementById('dashboard').classList.remove('hidden');
+      .then(function() {
+        document.getElementById('loginScreen').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
         refreshAll();
       })
-      .catch(() => {
-        document.getElementById('loginError').classList.remove('hidden');
+      .catch(function(err) {
+        document.getElementById('loginError').style.display = 'block';
+        btn.textContent = 'Sign In';
+        btn.disabled = false;
       });
   }
 
