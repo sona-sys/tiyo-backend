@@ -20,7 +20,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─── SECURITY & PERFORMANCE MIDDLEWARE ─────────────────
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.tailwindcss.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https:"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", "https:", "data:"],
+    },
+  },
+}));
 app.use(compression());
 app.use(cors({
   origin: function (origin, callback) {
