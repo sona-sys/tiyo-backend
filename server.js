@@ -485,6 +485,19 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
   }
 });
 
+// Step 1b: Check call status (used by both sides to detect cancel/reject)
+app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const call = await db.getCallById(callId);
+    if (!call) return res.status(404).json({ error: 'Call not found' });
+    res.json({ status: call.status });
+  } catch (err) {
+    console.error('Call status error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Step 2: Get Agora token (for reconnection or creator joining)
 app.post('/api/calls/token', requireAuth, async (req, res) => {
   try {
