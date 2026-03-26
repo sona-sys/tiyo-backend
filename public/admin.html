@@ -97,23 +97,30 @@
 
   // ─── Auth ─────────────────────────────────────────────
   function doLogin() {
+    console.log('[ADMIN] doLogin called');
     adminKey = document.getElementById('passwordInput').value.trim();
-    if (!adminKey) return;
+    console.log('[ADMIN] password length:', adminKey.length);
+    if (!adminKey) { console.log('[ADMIN] empty password, returning'); return; }
     var btn = document.querySelector('#loginScreen button');
     btn.textContent = 'Signing in...';
     btn.disabled = true;
+    var url = BASE + '/api/admin/stats';
+    console.log('[ADMIN] fetching:', url);
     // Test the key by hitting stats endpoint
-    fetch(BASE + '/api/admin/stats', { headers: { 'x-admin-key': adminKey } })
+    fetch(url, { headers: { 'x-admin-key': adminKey } })
       .then(function(r) {
-        if (!r.ok) throw new Error('bad key');
+        console.log('[ADMIN] response status:', r.status);
+        if (!r.ok) throw new Error('bad key, status: ' + r.status);
         return r.json();
       })
-      .then(function() {
+      .then(function(data) {
+        console.log('[ADMIN] login success, stats:', JSON.stringify(data).substring(0, 100));
         document.getElementById('loginScreen').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         refreshAll();
       })
       .catch(function(err) {
+        console.error('[ADMIN] login failed:', err.message);
         document.getElementById('loginError').style.display = 'block';
         btn.textContent = 'Sign In';
         btn.disabled = false;
