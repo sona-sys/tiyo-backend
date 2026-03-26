@@ -48,6 +48,9 @@ const authLimiter = rateLimit({
 // Serve static files (admin dashboard)
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Redirect /admin to /admin.html for convenience
+app.get('/admin', (req, res) => res.redirect('/admin.html'));
+
 // ─── AUTH ROUTES (public — no token required) ───────────
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -491,7 +494,13 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
     const { callId } = req.params;
     const call = await db.getCallById(callId);
     if (!call) return res.status(404).json({ error: 'Call not found' });
-    res.json({ status: call.status });
+
+    // Include server-side elapsed seconds so both clients can sync timers
+    let elapsedSeconds = 0;
+    if (call.start_time && call.status === 'connected') {
+      elapsedSeconds = Math.floor((Date.now() - new Date(call.start_time).getTime()) / 1000);
+    }
+    res.json({ status: call.status, elapsedSeconds });
   } catch (err) {
     console.error('Call status error:', err);
     res.status(500).json({ error: 'Server error' });
