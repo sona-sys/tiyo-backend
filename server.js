@@ -1,5 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -16,15 +19,38 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// ─── SECURITY & PERFORMANCE MIDDLEWARE ─────────────────
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no Origin header (mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    const allowed = [
+      'https://tiyo-api.onrender.com',
+      ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000'] : []),
+    ];
+    if (allowed.includes(origin)) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
+}));
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limiter for auth routes — 10 attempts per 15 minutes per IP
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later' },
+});
 
 // Serve static files (admin dashboard)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── AUTH ROUTES (public — no token required) ───────────
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
@@ -37,7 +63,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/verify', async (req, res) => {
+app.post('/api/auth/verify', authLimiter, async (req, res) => {
   try {
     const { phone, otp } = req.body;
     if (!phone || !otp) {
@@ -305,6 +331,12 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
 // ─── WALLET ROUTES (protected) ──────────────────────────
 
 app.post('/api/wallet/topup', requireAuth, async (req, res) => {
+  // Direct topup only allowed in dev/test mode (mock payments).
+  // In production, wallet credits go through /api/payments/verify (Razorpay).
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Direct topup disabled in production. Use payment gateway.' });
+  }
+
   try {
     const { amount } = req.body;
     const userId = req.userId; // from JWT — tamper-proof
@@ -326,6 +358,12 @@ app.post('/api/wallet/log', requireAuth, async (req, res) => {
   try {
     const { amount, status } = req.body;
     const userId = req.userId;
+
+    // Only allow logging failed/abandoned attempts — success must come from /payments/verify
+    const allowedStatuses = ['failed', 'abandoned', 'pending'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status. Allowed: failed, abandoned, pending' });
+    }
 
     const user = await db.findUserById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -495,28 +533,17 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
 // Step 4: End call — server calculates duration + cost
 app.post('/api/calls/end', requireAuth, async (req, res) => {
   try {
-    const { callId, receiverId, durationSeconds } = req.body;
+    const { callId } = req.body;
 
-    // V22 path: end by callId (server calculates duration)
-    if (callId) {
-      const result = await db.processCallEndById(callId);
-      if (result.error) {
-        return res.status(400).json({ error: result.error });
-      }
-      return res.json(result);
+    if (!callId) {
+      return res.status(400).json({ error: 'callId is required' });
     }
 
-    // Legacy V19 path: end by receiverId + client-reported duration
-    if (receiverId && durationSeconds !== undefined) {
-      const callerId = req.userId;
-      const result = await db.processCallEnd(callerId, receiverId, durationSeconds);
-      if (result.error) {
-        return res.status(400).json({ error: result.error });
-      }
-      return res.json(result);
+    const result = await db.processCallEndById(callId);
+    if (result.error) {
+      return res.status(400).json({ error: result.error });
     }
-
-    res.status(400).json({ error: 'callId or (receiverId + durationSeconds) required' });
+    return res.json(result);
   } catch (err) {
     console.error('End call error:', err);
     res.status(500).json({ error: 'Server error' });

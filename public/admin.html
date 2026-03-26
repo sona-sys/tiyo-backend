@@ -89,7 +89,7 @@
     adminKey = document.getElementById('passwordInput').value.trim();
     if (!adminKey) return;
     // Test the key by hitting stats endpoint
-    fetch(BASE + '/api/admin/stats?key=' + encodeURIComponent(adminKey))
+    fetch(BASE + '/api/admin/stats', { headers: { 'x-admin-key': adminKey } })
       .then(r => {
         if (!r.ok) throw new Error('bad key');
         return r.json();
@@ -110,7 +110,7 @@
 
   // ─── API helpers ──────────────────────────────────────
   function api(endpoint) {
-    return fetch(BASE + endpoint + (endpoint.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(adminKey))
+    return fetch(BASE + endpoint, { headers: { 'x-admin-key': adminKey } })
       .then(r => r.json());
   }
 
