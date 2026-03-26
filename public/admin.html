@@ -25,6 +25,8 @@
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     table { border-collapse: collapse; width: 100%; }
     th { position: sticky; top: 0; z-index: 1; }
+    /* Fallback: don't rely on Tailwind CDN for initial visibility */
+    .hidden { display: none !important; }
   </style>
 </head>
 <body class="bg-dark-900 text-gray-200 min-h-screen">
