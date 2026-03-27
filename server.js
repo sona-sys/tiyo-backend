@@ -8,7 +8,7 @@ const dotenv = require('dotenv');
 dotenv.config();
 
 const db = require('./db/queries');
-const { generateToken, requireAuth } = require('./middleware/auth');
+const { generateToken, requireAuth, optionalAuth } = require('./middleware/auth');
 const { sendOTP, verifyOTP } = require('./auth/supabase');
 const { RAZORPAY_KEY_ID, createOrder, verifyPaymentSignature } = require('./payments/razorpay');
 const { AGORA_APP_ID, isMockMode: agoraMockMode, generateRtcToken, generateChannelName } = require('./calling/agora');
@@ -212,11 +212,25 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
 
 app.put('/api/users/profile', requireAuth, async (req, res) => {
   try {
-    const { name, avatar } = req.body;
+    const { name, handle } = req.body;
     const userId = req.userId;
 
     if (name !== undefined) {
       await db.updateUserName(userId, name);
+    }
+
+    if (handle !== undefined && handle !== null) {
+      const trimmed = handle.trim().toLowerCase();
+      if (trimmed.length < 3 || trimmed.length > 30) {
+        return res.status(400).json({ error: 'Handle must be 3-30 characters' });
+      }
+      if (!/^[a-z0-9_]+$/.test(trimmed)) {
+        return res.status(400).json({ error: 'Handle can only contain lowercase letters, numbers and underscores' });
+      }
+      const result = await db.updateUserHandle(userId, trimmed);
+      if (result?.error === 'handle_taken') {
+        return res.status(409).json({ error: 'This handle is already taken' });
+      }
     }
 
     const user = await db.findUserById(userId);
@@ -229,9 +243,9 @@ app.put('/api/users/profile', requireAuth, async (req, res) => {
 
 // ─── CREATORS ROUTE (public — browsing doesn't need auth) ──
 
-app.get('/api/creators', async (req, res) => {
+app.get('/api/creators', optionalAuth, async (req, res) => {
   try {
-    const creators = await db.getCreators();
+    const creators = await db.getCreators(req.userId);
     res.json(creators);
   } catch (err) {
     console.error('Get creators error:', err);
@@ -469,6 +483,18 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'receiverId is required' });
     }
 
+    // V38: Check if caller is suspended
+    const callerStatus = await db.getUserStatus(callerId);
+    if (callerStatus !== 'active') {
+      return res.status(403).json({ error: 'Your account is suspended. Contact support.' });
+    }
+
+    // V38: Check if caller is blocked by receiver
+    const blocked = await db.isBlocked(receiverId, callerId);
+    if (blocked) {
+      return res.status(403).json({ error: 'This creator is not available' });
+    }
+
     // Generate unique channel name
     const channelName = generateChannelName(callerId, receiverId);
 
@@ -584,6 +610,61 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
   }
 });
 
+// ─── BLOCK ROUTES (V38 — protected) ─────────────────────
+
+app.post('/api/blocks', requireAuth, async (req, res) => {
+  try {
+    const { userId: blockedId } = req.body;
+    const blockerId = req.userId;
+
+    if (!blockedId) return res.status(400).json({ error: 'userId is required' });
+    if (blockedId === blockerId) return res.status(400).json({ error: 'Cannot block yourself' });
+
+    const blocked = await db.blockUser(blockerId, blockedId);
+    if (!blocked) {
+      return res.json({ success: true, message: 'Already blocked' });
+    }
+
+    // Check if this triggers auto-suspension
+    const suspendResult = await db.checkAndSuspendUser(blockedId);
+    if (suspendResult.suspended) {
+      console.log(`User ${blockedId} auto-suspended after ${suspendResult.blockCount} blocks`);
+    }
+
+    res.json({ success: true, block: blocked });
+  } catch (err) {
+    console.error('Block user error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/blocks/:userId', requireAuth, async (req, res) => {
+  try {
+    const blockedId = parseInt(req.params.userId);
+    const blockerId = req.userId;
+
+    const unblocked = await db.unblockUser(blockerId, blockedId);
+    if (!unblocked) {
+      return res.status(404).json({ error: 'Block not found' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Unblock user error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/blocks', requireAuth, async (req, res) => {
+  try {
+    const blockedUsers = await db.getBlockedUsers(req.userId);
+    res.json(blockedUsers);
+  } catch (err) {
+    console.error('Get blocked users error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── ADMIN ROUTES (V34 — protected by admin key) ────────
 
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
@@ -642,6 +723,32 @@ app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
   }
 });
 
+// V38: Suspended users management
+app.get('/api/admin/suspended-users', requireAdmin, async (req, res) => {
+  try {
+    const users = await db.adminGetSuspendedUsers();
+    res.json(users);
+  } catch (err) {
+    console.error('Admin suspended users error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/unsuspend', requireAdmin, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const result = await db.unsuspendUser(userId);
+    if (!result) {
+      return res.status(404).json({ error: 'User not found or not suspended' });
+    }
+    console.log(`Admin unsuspended user ${userId}`);
+    res.json({ success: true, user: result });
+  } catch (err) {
+    console.error('Admin unsuspend error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── HEALTH CHECK ───────────────────────────────────────
 
 app.get('/', (req, res) => {
@@ -658,6 +765,8 @@ function formatUserForClient(user) {
     role: user.role || 'user',
     balance: user.balance != null ? parseFloat(user.balance) : 0,
     bio: user.bio || null,
+    handle: user.handle || null,
+    status: user.status || 'active',
   };
 }
 

@@ -79,6 +79,7 @@
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('creators')">Creators</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('calls')">Calls</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('transactions')">Transactions</button>
+      <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('suspended')">Suspended</button>
     </div>
 
     <!-- Tab Content -->
@@ -176,6 +177,7 @@
       case 'creators': return api('/api/admin/creators').then(renderCreatorsTable);
       case 'calls': return api('/api/admin/calls?limit=100').then(renderCallsTable);
       case 'transactions': return api('/api/admin/transactions?limit=100').then(renderTransactionsTable);
+      case 'suspended': return api('/api/admin/suspended-users').then(renderSuspendedTable);
     }
   }
 
@@ -204,6 +206,7 @@
       success: 'bg-green-900 text-green-300',
       failed: 'bg-red-900 text-red-300',
       pending: 'bg-yellow-900 text-yellow-300',
+      suspended: 'bg-red-900 text-red-300',
     };
     const cls = colors[status] || 'bg-dark-700 text-gray-400';
     return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + cls + '">' + (status || '—') + '</span>';
@@ -297,6 +300,41 @@
     });
     html += '</tbody></table>';
     document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function renderSuspendedTable(users) {
+    if (!users || users.length === 0) {
+      document.getElementById('tableContainer').innerHTML =
+        '<div class="p-8 text-center text-gray-500">No suspended users</div>';
+      return;
+    }
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Name</th><th class="px-4 py-3">Phone</th>';
+    html += '<th class="px-4 py-3">Block Count</th><th class="px-4 py-3">Status</th>';
+    html += '<th class="px-4 py-3">Action</th></tr></thead><tbody>';
+    users.forEach(u => {
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + u.id + '</td>';
+      html += '<td class="px-4 py-3 text-sm font-medium">' + (u.name || '—') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + u.phone + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-red-400">' + (u.block_count || '—') + '</td>';
+      html += '<td class="px-4 py-3">' + statusBadge('suspended') + '</td>';
+      html += '<td class="px-4 py-3"><button onclick="unsuspendUser(' + u.id + ')" class="bg-green-700 text-white text-xs px-3 py-1 rounded-full hover:bg-green-600">Unsuspend</button></td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function unsuspendUser(userId) {
+    if (!confirm('Unsuspend user #' + userId + '?')) return;
+    fetch(BASE + '/api/admin/users/' + userId + '/unsuspend', {
+      method: 'POST',
+      headers: { 'x-admin-key': adminKey, 'Content-Type': 'application/json' },
+    })
+      .then(r => { if (!r.ok) throw new Error('Failed'); return r.json(); })
+      .then(() => { alert('User unsuspended!'); loadTab('suspended'); })
+      .catch(err => alert('Error: ' + err.message));
   }
 
   // ─── Refresh all data ─────────────────────────────────

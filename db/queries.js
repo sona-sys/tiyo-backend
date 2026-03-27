@@ -53,26 +53,43 @@ async function updateUserName(id, name) {
   return rows[0] || null;
 }
 
+async function updateUserHandle(id, handle) {
+  // Check uniqueness first
+  const { rows: existing } = await pool.query(
+    'SELECT id FROM users WHERE handle = $1 AND id != $2',
+    [handle, id]
+  );
+  if (existing.length > 0) return { error: 'handle_taken' };
+
+  const { rows } = await pool.query(
+    'UPDATE users SET handle = $1 WHERE id = $2 RETURNING *',
+    [handle, id]
+  );
+  return rows[0] || null;
+}
+
 // ─── CREATORS ───────────────────────────────────────────
 
-async function getCreators() {
+async function getCreators(requestingUserId = null) {
   const { rows } = await pool.query(`
     SELECT
-      u.id, COALESCE(u.name, u.phone, 'Creator') AS name, u.role, u.bio,
+      u.id, COALESCE(u.name, u.phone, 'Creator') AS name, u.handle, u.role, u.bio,
       c.rate, c.video_rate AS "videoRate", c.languages, c.categories, c.image_color AS "imageColor",
       c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
     JOIN creators c ON u.id = c.user_id
     WHERE u.role = 'creator' AND u.name IS NOT NULL AND u.name != ''
+      AND u.status = 'active'
+      AND ($1::int IS NULL OR u.id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = $1))
     ORDER BY u.id
-  `);
+  `, [requestingUserId]);
   return rows;
 }
 
 async function getCreatorById(id) {
   const { rows } = await pool.query(`
     SELECT
-      u.id, u.name, u.role, u.bio,
+      u.id, u.name, u.handle, u.role, u.bio,
       c.rate, c.video_rate AS "videoRate", c.languages, c.categories, c.image_color AS "imageColor",
       c.is_online AS "online", c.rating, c.total_calls AS "totalCalls"
     FROM users u
@@ -236,7 +253,7 @@ async function getUserCalls(userId) {
   const { rows } = await pool.query(`
     SELECT
       c.id,
-      u.name AS "creatorName",
+      COALESCE(u.name, u.phone, 'Unknown') AS "creatorName",
       cr.image_color AS "creatorColor",
       c.duration_seconds AS "durationSeconds",
       c.total_cost AS cost,
@@ -552,7 +569,7 @@ async function getCreatorDashboard(userId) {
   // Get recent calls received
   const { rows: recentCalls } = await pool.query(`
     SELECT c.id, c.duration_seconds, c.total_cost, c.status, c.created_at,
-           u.name AS caller_name
+           COALESCE(u.name, u.phone, 'Unknown') AS caller_name
     FROM calls c
     JOIN users u ON c.caller_id = u.id
     WHERE c.receiver_id = $1
@@ -681,6 +698,87 @@ async function adminGetTransactions(limit = 50, offset = 0) {
   return rows.map(r => ({ ...r, amount: parseFloat(r.amount) }));
 }
 
+// ─── BLOCKS & SUSPENSION (V38) ─────────────────────────
+
+async function blockUser(blockerId, blockedId) {
+  const { rows } = await pool.query(`
+    INSERT INTO blocks (blocker_id, blocked_id)
+    VALUES ($1, $2)
+    ON CONFLICT (blocker_id, blocked_id) DO NOTHING
+    RETURNING *
+  `, [blockerId, blockedId]);
+  return rows[0] || null;
+}
+
+async function unblockUser(blockerId, blockedId) {
+  const { rows } = await pool.query(
+    'DELETE FROM blocks WHERE blocker_id = $1 AND blocked_id = $2 RETURNING *',
+    [blockerId, blockedId]
+  );
+  return rows[0] || null;
+}
+
+async function getBlockedUsers(blockerId) {
+  const { rows } = await pool.query(`
+    SELECT b.blocked_id AS id, b.created_at,
+           COALESCE(u.name, u.phone, 'Unknown') AS name, u.phone
+    FROM blocks b
+    JOIN users u ON b.blocked_id = u.id
+    WHERE b.blocker_id = $1
+    ORDER BY b.created_at DESC
+  `, [blockerId]);
+  return rows;
+}
+
+async function isBlocked(blockerId, blockedId) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM blocks WHERE blocker_id = $1 AND blocked_id = $2',
+    [blockerId, blockedId]
+  );
+  return rows.length > 0;
+}
+
+async function checkAndSuspendUser(userId, threshold = 3) {
+  const { rows } = await pool.query(
+    'SELECT COUNT(DISTINCT blocker_id)::int AS cnt FROM blocks WHERE blocked_id = $1',
+    [userId]
+  );
+  if (rows[0].cnt >= threshold) {
+    await pool.query(
+      "UPDATE users SET status = 'suspended' WHERE id = $1 AND status = 'active'",
+      [userId]
+    );
+    return { suspended: true, blockCount: rows[0].cnt };
+  }
+  return { suspended: false, blockCount: rows[0].cnt };
+}
+
+async function unsuspendUser(userId) {
+  const { rows } = await pool.query(
+    "UPDATE users SET status = 'active' WHERE id = $1 RETURNING *",
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+async function getUserStatus(userId) {
+  const { rows } = await pool.query('SELECT status FROM users WHERE id = $1', [userId]);
+  return rows[0]?.status || 'active';
+}
+
+async function adminGetSuspendedUsers() {
+  const { rows } = await pool.query(`
+    SELECT u.id, u.name, u.phone, u.status, u.created_at,
+           COUNT(b.id)::int AS block_count
+    FROM users u
+    LEFT JOIN blocks b ON u.id = b.blocked_id
+    WHERE u.status = 'suspended'
+    GROUP BY u.id
+    ORDER BY u.created_at DESC
+  `);
+  return rows;
+}
+
 module.exports = {
   findUserByPhone,
   findUserById,
@@ -714,4 +812,14 @@ module.exports = {
   adminGetCreators,
   adminGetCalls,
   adminGetTransactions,
+  // V38 — Handle, Blocks, Suspension
+  updateUserHandle,
+  blockUser,
+  unblockUser,
+  getBlockedUsers,
+  isBlocked,
+  checkAndSuspendUser,
+  unsuspendUser,
+  getUserStatus,
+  adminGetSuspendedUsers,
 };

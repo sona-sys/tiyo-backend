@@ -42,4 +42,26 @@ function requireAuth(req, res, next) {
   }
 }
 
-module.exports = { generateToken, requireAuth, JWT_SECRET };
+/**
+ * Optional auth — extracts userId from JWT if present, but doesn't reject if missing.
+ * Sets req.userId = null when no valid token is provided.
+ */
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  req.userId = null;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      req.userId = decoded.userId;
+      req.userPhone = decoded.phone;
+    } catch (err) {
+      // Invalid or expired token — proceed without auth
+    }
+  }
+
+  next();
+}
+
+module.exports = { generateToken, requireAuth, optionalAuth, JWT_SECRET };
