@@ -339,6 +339,7 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId is required' });
 
+    await db.cleanupStaleRingingCalls();
     const existingCall = await db.getCallById(callId);
     if (!existingCall || existingCall.receiver_id !== req.userId) {
       return res.status(404).json({ error: 'Call not found' });
@@ -377,8 +378,20 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId is required' });
 
+    await db.cleanupStaleRingingCalls();
+    const existingCall = await db.getCallById(callId);
+    if (!existingCall) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    if (existingCall.receiver_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (existingCall.status !== 'ringing' || existingCall.end_time) {
+      return res.status(409).json({ error: 'This call has already ended' });
+    }
+
     const call = await db.rejectCallById(callId);
-    if (!call) return res.status(404).json({ error: 'Call not found or already handled' });
+    if (!call) return res.status(409).json({ error: 'This call has already ended' });
 
     console.log(`Call rejected by creator: ${callId}`);
     res.json({ success: true });
@@ -520,10 +533,32 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Your account is suspended. Contact support.' });
     }
 
+    const receiver = await db.getCreatorById(receiverId);
+    if (!receiver || receiver.role !== 'creator') {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    const receiverStatus = await db.getUserStatus(receiverId);
+    if (receiverStatus !== 'active' || !receiver.online) {
+      return res.status(409).json({ error: 'This creator is unavailable right now.' });
+    }
+
     // V38: Check if caller is blocked by receiver
     const blocked = await db.isBlocked(receiverId, callerId);
     if (blocked) {
       return res.status(403).json({ error: 'This creator is not available' });
+    }
+
+    await db.cleanupStaleRingingCalls();
+
+    const callerOngoingCall = await db.getOngoingCallForUser(callerId);
+    if (callerOngoingCall) {
+      return res.status(409).json({ error: 'You already have a call in progress.' });
+    }
+
+    const receiverOngoingCall = await db.getOngoingCallForUser(receiverId);
+    if (receiverOngoingCall) {
+      return res.status(409).json({ error: 'This creator is currently on another call.' });
     }
 
     // Generate unique channel name
@@ -570,6 +605,7 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
   try {
     const { callId } = req.params;
+    await db.cleanupStaleRingingCalls();
     const call = await db.getCallById(callId);
     if (!call) return res.status(404).json({ error: 'Call not found' });
     if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
@@ -634,9 +670,24 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'callId is required' });
     }
 
+    await db.cleanupStaleRingingCalls();
+    const existingCall = await db.getCallById(callId);
+    if (!existingCall) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    if (existingCall.caller_id !== req.userId && existingCall.receiver_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (existingCall.status === 'connected' && existingCall.start_time) {
+      return res.json({ success: true, startTime: existingCall.start_time, alreadyConnected: true });
+    }
+    if (existingCall.status !== 'ringing' || existingCall.end_time) {
+      return res.status(409).json({ error: 'This call is no longer available' });
+    }
+
     const call = await db.connectCallById(callId);
     if (!call) {
-      return res.status(404).json({ error: 'Call not found or already connected' });
+      return res.status(409).json({ error: 'This call is no longer available' });
     }
 
     console.log(`Call connected: ${callId} at ${call.start_time}`);
@@ -655,6 +706,14 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
 
     if (!callId) {
       return res.status(400).json({ error: 'callId is required' });
+    }
+
+    const existingCall = await db.getCallById(callId);
+    if (!existingCall) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    if (existingCall.caller_id !== req.userId && existingCall.receiver_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     const result = await db.processCallEndById(callId);

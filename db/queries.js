@@ -1,4 +1,5 @@
 const pool = require('./pool');
+const RINGING_TIMEOUT_SECONDS = 45;
 
 // ─── USERS ──────────────────────────────────────────────
 
@@ -463,6 +464,36 @@ async function initiateCall(callerId, receiverId, channelName, callType = 'voice
   return rows[0];
 }
 
+async function cleanupStaleRingingCalls(timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
+  const { rows } = await pool.query(`
+    UPDATE calls
+    SET status = 'missed',
+        end_time = COALESCE(end_time, NOW())
+    WHERE status = 'ringing'
+      AND created_at < NOW() - make_interval(secs => $1)
+    RETURNING id
+  `, [timeoutSeconds]);
+  return rows.length;
+}
+
+async function getOngoingCallForUser(userId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
+  const { rows } = await pool.query(`
+    SELECT *
+    FROM calls
+    WHERE (caller_id = $1 OR receiver_id = $1)
+      AND (
+        status = 'connected'
+        OR (
+          status = 'ringing'
+          AND created_at >= NOW() - make_interval(secs => $2)
+        )
+      )
+    ORDER BY created_at DESC
+    LIMIT 1
+  `, [userId, timeoutSeconds]);
+  return rows[0] || null;
+}
+
 async function connectCallById(callId) {
   const { rows } = await pool.query(`
     UPDATE calls SET status = 'connected', start_time = NOW()
@@ -783,6 +814,7 @@ async function getCreatorDashboard(userId) {
 }
 
 async function getCreatorIncomingCalls(userId) {
+  await cleanupStaleRingingCalls();
   const { rows } = await pool.query(`
     SELECT c.id, c.caller_id, c.channel_name, c.call_type, c.status, c.created_at,
            u.name AS caller_name,
@@ -1026,4 +1058,6 @@ module.exports = {
   unsuspendUser,
   getUserStatus,
   adminGetSuspendedUsers,
+  cleanupStaleRingingCalls,
+  getOngoingCallForUser,
 };
