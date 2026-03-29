@@ -179,7 +179,7 @@ async function getUserTransactions(userId) {
   const callEntries = calls.map(c => ({
     id: `call_${c.id}`,
     type: 'call',
-    amount: -parseFloat(c.total_cost),
+    amount: -(c.total_cost ? parseFloat(c.total_cost) : 0),
     title: `Call with ${c.creator_name || 'Unknown'}`,
     durationSeconds: c.duration_seconds,
     timestamp: c.timestamp
@@ -188,7 +188,7 @@ async function getUserTransactions(userId) {
   const earningEntries = earnings.map(c => ({
     id: `earning_${c.id}`,
     type: 'earning',
-    amount: parseFloat(c.total_cost),
+    amount: c.total_cost ? parseFloat(c.total_cost) : 0,
     title: `Earned from ${c.caller_name || 'Unknown'}`,
     durationSeconds: c.duration_seconds,
     timestamp: c.timestamp
@@ -267,7 +267,7 @@ async function getUserCalls(userId) {
 
   return rows.map(r => ({
     ...r,
-    cost: parseFloat(r.cost)
+    cost: r.cost ? parseFloat(r.cost) : 0,
   }));
 }
 
