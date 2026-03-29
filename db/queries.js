@@ -278,6 +278,9 @@ async function getCreatorReceivedCalls(userId) {
       c.caller_id AS "callerId",
       COALESCE(u.name, u.phone, 'Unknown') AS "callerName",
       u.phone AS "callerPhone",
+      COALESCE(u.user_rating, 0) AS "callerRating",
+      COALESCE(u.user_rating_count, 0)::int AS "callerRatingCount",
+      c.caller_rating AS "ratingGiven",
       c.status,
       c.call_type AS "callType",
       c.duration_seconds AS "durationSeconds",
@@ -292,6 +295,7 @@ async function getCreatorReceivedCalls(userId) {
   return rows.map(r => ({
     ...r,
     earnings: r.earnings ? parseFloat(r.earnings) : 0,
+    callerRating: r.callerRating ? parseFloat(r.callerRating) : 0,
   }));
 }
 
@@ -302,6 +306,9 @@ async function getCreatorReceivedCallDetail(userId, callId) {
       c.caller_id AS "callerId",
       COALESCE(u.name, u.phone, 'Unknown') AS "callerName",
       u.phone AS "callerPhone",
+      COALESCE(u.user_rating, 0) AS "callerRating",
+      COALESCE(u.user_rating_count, 0)::int AS "callerRatingCount",
+      c.caller_rating AS "ratingGiven",
       c.status,
       c.call_type AS "callType",
       c.duration_seconds AS "durationSeconds",
@@ -323,7 +330,118 @@ async function getCreatorReceivedCallDetail(userId, callId) {
   return {
     ...rows[0],
     earnings: rows[0].earnings ? parseFloat(rows[0].earnings) : 0,
+    callerRating: rows[0].callerRating ? parseFloat(rows[0].callerRating) : 0,
   };
+}
+
+async function submitCreatorRating(callId, callerId, rating) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: callRows } = await client.query(
+      'SELECT * FROM calls WHERE id = $1 FOR UPDATE',
+      [callId]
+    );
+    const call = callRows[0];
+
+    if (!call || call.caller_id !== callerId) {
+      await client.query('ROLLBACK');
+      return { error: 'Call not found' };
+    }
+
+    if (call.status !== 'completed') {
+      await client.query('ROLLBACK');
+      return { error: 'Only completed calls can be rated' };
+    }
+
+    if (call.creator_rating != null) {
+      await client.query('ROLLBACK');
+      return { error: 'You have already rated this creator' };
+    }
+
+    await client.query(
+      'UPDATE calls SET creator_rating = $1 WHERE id = $2',
+      [rating, callId]
+    );
+
+    const { rows: creatorRows } = await client.query(
+      'SELECT rating, rating_count FROM creators WHERE user_id = $1 FOR UPDATE',
+      [call.receiver_id]
+    );
+    const currentRating = creatorRows[0]?.rating ? parseFloat(creatorRows[0].rating) : 0;
+    const currentCount = creatorRows[0]?.rating_count ?? 0;
+    const ratingCount = currentCount + 1;
+    const nextRating = Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2));
+
+    await client.query(
+      'UPDATE creators SET rating = $1, rating_count = $2 WHERE user_id = $3',
+      [nextRating, ratingCount, call.receiver_id]
+    );
+
+    await client.query('COMMIT');
+    return { success: true, rating: nextRating, ratingCount };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function submitCallerRating(callId, creatorId, rating) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: callRows } = await client.query(
+      'SELECT * FROM calls WHERE id = $1 FOR UPDATE',
+      [callId]
+    );
+    const call = callRows[0];
+
+    if (!call || call.receiver_id !== creatorId) {
+      await client.query('ROLLBACK');
+      return { error: 'Call not found' };
+    }
+
+    if (call.status !== 'completed') {
+      await client.query('ROLLBACK');
+      return { error: 'Only completed calls can be rated' };
+    }
+
+    if (call.caller_rating != null) {
+      await client.query('ROLLBACK');
+      return { error: 'You have already rated this caller' };
+    }
+
+    await client.query(
+      'UPDATE calls SET caller_rating = $1 WHERE id = $2',
+      [rating, callId]
+    );
+
+    const { rows: userRows } = await client.query(
+      'SELECT user_rating, user_rating_count FROM users WHERE id = $1 FOR UPDATE',
+      [call.caller_id]
+    );
+    const currentRating = userRows[0]?.user_rating ? parseFloat(userRows[0].user_rating) : 0;
+    const currentCount = userRows[0]?.user_rating_count ?? 0;
+    const ratingCount = currentCount + 1;
+    const nextRating = Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2));
+
+    await client.query(
+      'UPDATE users SET user_rating = $1, user_rating_count = $2 WHERE id = $3',
+      [nextRating, ratingCount, call.caller_id]
+    );
+
+    await client.query('COMMIT');
+    return { success: true, rating: nextRating, ratingCount };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ─── CALL LIFECYCLE (V22) ───────────────────────────────
@@ -659,13 +777,18 @@ async function getCreatorDashboard(userId) {
 async function getCreatorIncomingCalls(userId) {
   const { rows } = await pool.query(`
     SELECT c.id, c.caller_id, c.channel_name, c.call_type, c.status, c.created_at,
-           u.name AS caller_name
+           u.name AS caller_name,
+           COALESCE(u.user_rating, 0) AS caller_rating,
+           COALESCE(u.user_rating_count, 0)::int AS caller_rating_count
     FROM calls c
     JOIN users u ON c.caller_id = u.id
     WHERE c.receiver_id = $1 AND c.status = 'ringing'
     ORDER BY c.created_at DESC
   `, [userId]);
-  return rows;
+  return rows.map(r => ({
+    ...r,
+    caller_rating: r.caller_rating ? parseFloat(r.caller_rating) : 0,
+  }));
 }
 
 async function rejectCallById(callId) {
@@ -863,6 +986,8 @@ module.exports = {
   getUserCalls,
   getCreatorReceivedCalls,
   getCreatorReceivedCallDetail,
+  submitCreatorRating,
+  submitCallerRating,
   processCallEnd,
   initiateCall,
   connectCallById,

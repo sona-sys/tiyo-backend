@@ -29,7 +29,16 @@ async function sendPushNotification(pushToken, title, body, data = {}) {
   }
 }
 
-async function sendCallNotificationToCreator(creatorUserId, callerName, callId, channelName, callType = 'voice') {
+async function sendCallNotificationToCreator({
+  creatorUserId,
+  callerId = null,
+  callerName,
+  callerRating = 0,
+  callerRatingCount = 0,
+  callId,
+  channelName,
+  callType = 'voice',
+}) {
   const { rows } = await pool.query(
     'SELECT push_token FROM users WHERE id = $1',
     [creatorUserId]
@@ -48,7 +57,10 @@ async function sendCallNotificationToCreator(creatorUserId, callerName, callId, 
       type: 'incoming_call',
       callId,
       channelName,
+      callerId,
       callerName: callerName || 'User',
+      callerRating,
+      callerRatingCount,
       callType,
     }
   );

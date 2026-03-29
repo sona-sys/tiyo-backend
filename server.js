@@ -539,7 +539,16 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 
     // Send push notification to the creator (non-blocking)
     const caller = await db.findUserById(callerId);
-    sendCallNotificationToCreator(receiverId, caller?.name, call.id, channelName, callType || 'voice')
+    sendCallNotificationToCreator({
+      creatorUserId: receiverId,
+      callerId,
+      callerName: caller?.name,
+      callerRating: caller?.user_rating != null ? parseFloat(caller.user_rating) : 0,
+      callerRatingCount: caller?.user_rating_count ?? 0,
+      callId: call.id,
+      channelName,
+      callType: callType || 'voice',
+    })
       .catch(err => console.error('Failed to notify creator:', err.message));
 
     res.json({
@@ -655,6 +664,56 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
     return res.json(result);
   } catch (err) {
     console.error('End call error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/calls/:callId/rate-creator', requireAuth, async (req, res) => {
+  try {
+    const callId = parseInt(req.params.callId);
+    const rating = parseInt(req.body.rating, 10);
+
+    if (!Number.isInteger(callId)) {
+      return res.status(400).json({ error: 'Valid callId is required' });
+    }
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+
+    const result = await db.submitCreatorRating(callId, req.userId, rating);
+    if (result?.error) {
+      const status = result.error.includes('already rated') ? 409 : 400;
+      return res.status(status).json({ error: result.error });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('Rate creator error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/calls/:callId/rate-caller', requireAuth, async (req, res) => {
+  try {
+    const callId = parseInt(req.params.callId);
+    const rating = parseInt(req.body.rating, 10);
+
+    if (!Number.isInteger(callId)) {
+      return res.status(400).json({ error: 'Valid callId is required' });
+    }
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+
+    const result = await db.submitCallerRating(callId, req.userId, rating);
+    if (result?.error) {
+      const status = result.error.includes('already rated') ? 409 : 400;
+      return res.status(status).json({ error: result.error });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('Rate caller error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -816,6 +875,8 @@ function formatUserForClient(user) {
     bio: user.bio || null,
     handle: user.handle || null,
     status: user.status || 'active',
+    userRating: user.user_rating != null ? parseFloat(user.user_rating) : 0,
+    userRatingCount: user.user_rating_count ?? 0,
   };
 }
 
