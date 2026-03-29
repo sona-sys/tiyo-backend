@@ -180,6 +180,28 @@ app.get('/api/users/:id/calls', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/api/creators/calls', requireAuth, async (req, res) => {
+  try {
+    const calls = await db.getCreatorReceivedCalls(req.userId);
+    res.json(calls);
+  } catch (err) {
+    console.error('Get creator received calls error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/calls/:callId', requireAuth, async (req, res) => {
+  try {
+    const callId = parseInt(req.params.callId);
+    const call = await db.getCreatorReceivedCallDetail(req.userId, callId);
+    if (!call) return res.status(404).json({ error: 'Call not found' });
+    res.json(call);
+  } catch (err) {
+    console.error('Get creator received call detail error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── PUSH TOKEN ROUTE ──────────────────────────────────
 
 app.post('/api/users/push-token', requireAuth, async (req, res) => {
@@ -317,9 +339,18 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId is required' });
 
+    const existingCall = await db.getCallById(callId);
+    if (!existingCall || existingCall.receiver_id !== req.userId) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    if (existingCall.status !== 'ringing' || existingCall.end_time) {
+      return res.status(409).json({ error: 'This call has already ended' });
+    }
+
     // Connect the call (same as /calls/connect but from creator side)
-    const call = await db.connectCallById(callId);
-    if (!call) return res.status(404).json({ error: 'Call not found or already connected' });
+    const call = await db.acceptCallById(callId, req.userId);
+    if (!call) return res.status(409).json({ error: 'This call has already ended' });
 
     // Generate Agora token for the creator
     const tokenData = generateRtcToken(call.channel_name, req.userId);
@@ -532,13 +563,31 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
     const { callId } = req.params;
     const call = await db.getCallById(callId);
     if (!call) return res.status(404).json({ error: 'Call not found' });
+    if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
     // Include server-side elapsed seconds so both clients can sync timers
     let elapsedSeconds = 0;
     if (call.start_time && call.status === 'connected') {
       elapsedSeconds = Math.floor((Date.now() - new Date(call.start_time).getTime()) / 1000);
     }
-    res.json({ status: call.status, elapsedSeconds });
+
+    let remainingBalance = null;
+    if (call.status === 'completed' || call.status === 'missed' || call.status === 'rejected') {
+      const user = await db.findUserById(req.userId);
+      remainingBalance = user?.balance != null ? parseFloat(user.balance) : null;
+    }
+
+    res.json({
+      status: call.status,
+      elapsedSeconds,
+      duration: call.duration_seconds ?? elapsedSeconds,
+      cost: call.total_cost != null ? parseFloat(call.total_cost) : 0,
+      remainingBalance,
+      callType: call.call_type || 'voice',
+      missed: call.status === 'missed',
+    });
   } catch (err) {
     console.error('Call status error:', err);
     res.status(500).json({ error: 'Server error' });

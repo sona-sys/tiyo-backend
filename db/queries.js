@@ -271,6 +271,61 @@ async function getUserCalls(userId) {
   }));
 }
 
+async function getCreatorReceivedCalls(userId) {
+  const { rows } = await pool.query(`
+    SELECT
+      c.id,
+      c.caller_id AS "callerId",
+      COALESCE(u.name, u.phone, 'Unknown') AS "callerName",
+      u.phone AS "callerPhone",
+      c.status,
+      c.call_type AS "callType",
+      c.duration_seconds AS "durationSeconds",
+      c.total_cost AS earnings,
+      c.created_at AS timestamp
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = $1
+    ORDER BY c.created_at DESC
+  `, [userId]);
+
+  return rows.map(r => ({
+    ...r,
+    earnings: r.earnings ? parseFloat(r.earnings) : 0,
+  }));
+}
+
+async function getCreatorReceivedCallDetail(userId, callId) {
+  const { rows } = await pool.query(`
+    SELECT
+      c.id,
+      c.caller_id AS "callerId",
+      COALESCE(u.name, u.phone, 'Unknown') AS "callerName",
+      u.phone AS "callerPhone",
+      c.status,
+      c.call_type AS "callType",
+      c.duration_seconds AS "durationSeconds",
+      c.total_cost AS earnings,
+      c.created_at AS timestamp,
+      EXISTS (
+        SELECT 1
+        FROM blocks b
+        WHERE b.blocker_id = $1 AND b.blocked_id = c.caller_id
+      ) AS blocked
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = $1 AND c.id = $2
+    LIMIT 1
+  `, [userId, callId]);
+
+  if (!rows[0]) return null;
+
+  return {
+    ...rows[0],
+    earnings: rows[0].earnings ? parseFloat(rows[0].earnings) : 0,
+  };
+}
+
 // ─── CALL LIFECYCLE (V22) ───────────────────────────────
 
 async function initiateCall(callerId, receiverId, channelName, callType = 'voice') {
@@ -288,6 +343,19 @@ async function connectCallById(callId) {
     WHERE id = $1 AND status = 'ringing'
     RETURNING *
   `, [callId]);
+  return rows[0] || null;
+}
+
+async function acceptCallById(callId, receiverId) {
+  const { rows } = await pool.query(`
+    UPDATE calls
+    SET status = 'connected', start_time = NOW()
+    WHERE id = $1
+      AND receiver_id = $2
+      AND status = 'ringing'
+      AND end_time IS NULL
+    RETURNING *
+  `, [callId, receiverId]);
   return rows[0] || null;
 }
 
@@ -793,9 +861,12 @@ module.exports = {
   getUserRecharges,
   createCallRecord,
   getUserCalls,
+  getCreatorReceivedCalls,
+  getCreatorReceivedCallDetail,
   processCallEnd,
   initiateCall,
   connectCallById,
+  acceptCallById,
   getCallById,
   processCallEndById,
   // V32 — Creator Mode
