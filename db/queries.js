@@ -355,10 +355,7 @@ async function submitCreatorRating(callId, callerId, rating) {
       return { error: 'Only completed calls can be rated' };
     }
 
-    if (call.creator_rating != null) {
-      await client.query('ROLLBACK');
-      return { error: 'You have already rated this creator' };
-    }
+    const previousRating = call.creator_rating != null ? parseInt(call.creator_rating, 10) : null;
 
     await client.query(
       'UPDATE calls SET creator_rating = $1 WHERE id = $2',
@@ -371,8 +368,11 @@ async function submitCreatorRating(callId, callerId, rating) {
     );
     const currentRating = creatorRows[0]?.rating ? parseFloat(creatorRows[0].rating) : 0;
     const currentCount = creatorRows[0]?.rating_count ?? 0;
-    const ratingCount = currentCount + 1;
-    const nextRating = Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2));
+    const ratingCount = previousRating == null ? currentCount + 1 : currentCount;
+
+    const nextRating = previousRating == null
+      ? Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2))
+      : Number((((currentRating * currentCount) - previousRating + rating) / Math.max(ratingCount, 1)).toFixed(2));
 
     await client.query(
       'UPDATE creators SET rating = $1, rating_count = $2 WHERE user_id = $3',
@@ -380,7 +380,7 @@ async function submitCreatorRating(callId, callerId, rating) {
     );
 
     await client.query('COMMIT');
-    return { success: true, rating: nextRating, ratingCount };
+    return { success: true, rating: nextRating, ratingCount, updated: previousRating != null };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -410,10 +410,7 @@ async function submitCallerRating(callId, creatorId, rating) {
       return { error: 'Only completed calls can be rated' };
     }
 
-    if (call.caller_rating != null) {
-      await client.query('ROLLBACK');
-      return { error: 'You have already rated this caller' };
-    }
+    const previousRating = call.caller_rating != null ? parseInt(call.caller_rating, 10) : null;
 
     await client.query(
       'UPDATE calls SET caller_rating = $1 WHERE id = $2',
@@ -426,8 +423,10 @@ async function submitCallerRating(callId, creatorId, rating) {
     );
     const currentRating = userRows[0]?.user_rating ? parseFloat(userRows[0].user_rating) : 0;
     const currentCount = userRows[0]?.user_rating_count ?? 0;
-    const ratingCount = currentCount + 1;
-    const nextRating = Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2));
+    const ratingCount = previousRating == null ? currentCount + 1 : currentCount;
+    const nextRating = previousRating == null
+      ? Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2))
+      : Number((((currentRating * currentCount) - previousRating + rating) / Math.max(ratingCount, 1)).toFixed(2));
 
     await client.query(
       'UPDATE users SET user_rating = $1, user_rating_count = $2 WHERE id = $3',
@@ -435,7 +434,7 @@ async function submitCallerRating(callId, creatorId, rating) {
     );
 
     await client.query('COMMIT');
-    return { success: true, rating: nextRating, ratingCount };
+    return { success: true, rating: nextRating, ratingCount, updated: previousRating != null };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
