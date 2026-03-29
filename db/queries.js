@@ -334,6 +334,46 @@ async function getCreatorReceivedCallDetail(userId, callId) {
   };
 }
 
+async function recalculateCreatorAggregateRating(client, creatorId) {
+  const { rows: aggregateRows } = await client.query(`
+    SELECT
+      COUNT(creator_rating)::int AS rating_count,
+      COALESCE(ROUND(AVG(creator_rating)::numeric, 2), 0)::numeric AS rating
+    FROM calls
+    WHERE receiver_id = $1 AND creator_rating IS NOT NULL
+  `, [creatorId]);
+
+  const ratingCount = aggregateRows[0]?.rating_count ?? 0;
+  const rating = aggregateRows[0]?.rating ? parseFloat(aggregateRows[0].rating) : 0;
+
+  await client.query(
+    'UPDATE creators SET rating = $1, rating_count = $2 WHERE user_id = $3',
+    [rating, ratingCount, creatorId]
+  );
+
+  return { rating, ratingCount };
+}
+
+async function recalculateCallerAggregateRating(client, callerId) {
+  const { rows: aggregateRows } = await client.query(`
+    SELECT
+      COUNT(caller_rating)::int AS rating_count,
+      COALESCE(ROUND(AVG(caller_rating)::numeric, 2), 0)::numeric AS rating
+    FROM calls
+    WHERE caller_id = $1 AND caller_rating IS NOT NULL
+  `, [callerId]);
+
+  const ratingCount = aggregateRows[0]?.rating_count ?? 0;
+  const rating = aggregateRows[0]?.rating ? parseFloat(aggregateRows[0].rating) : 0;
+
+  await client.query(
+    'UPDATE users SET user_rating = $1, user_rating_count = $2 WHERE id = $3',
+    [rating, ratingCount, callerId]
+  );
+
+  return { rating, ratingCount };
+}
+
 async function submitCreatorRating(callId, callerId, rating) {
   const client = await pool.connect();
   try {
@@ -355,32 +395,16 @@ async function submitCreatorRating(callId, callerId, rating) {
       return { error: 'Only completed calls can be rated' };
     }
 
-    const previousRating = call.creator_rating != null ? parseInt(call.creator_rating, 10) : null;
-
     await client.query(
       'UPDATE calls SET creator_rating = $1 WHERE id = $2',
       [rating, callId]
     );
 
-    const { rows: creatorRows } = await client.query(
-      'SELECT rating, rating_count FROM creators WHERE user_id = $1 FOR UPDATE',
-      [call.receiver_id]
-    );
-    const currentRating = creatorRows[0]?.rating ? parseFloat(creatorRows[0].rating) : 0;
-    const currentCount = creatorRows[0]?.rating_count ?? 0;
-    const ratingCount = previousRating == null ? currentCount + 1 : currentCount;
-
-    const nextRating = previousRating == null
-      ? Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2))
-      : Number((((currentRating * currentCount) - previousRating + rating) / Math.max(ratingCount, 1)).toFixed(2));
-
-    await client.query(
-      'UPDATE creators SET rating = $1, rating_count = $2 WHERE user_id = $3',
-      [nextRating, ratingCount, call.receiver_id]
-    );
+    const previousRating = call.creator_rating != null ? parseInt(call.creator_rating, 10) : null;
+    const aggregate = await recalculateCreatorAggregateRating(client, call.receiver_id);
 
     await client.query('COMMIT');
-    return { success: true, rating: nextRating, ratingCount, updated: previousRating != null };
+    return { success: true, rating: aggregate.rating, ratingCount: aggregate.ratingCount, updated: previousRating != null };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -410,31 +434,16 @@ async function submitCallerRating(callId, creatorId, rating) {
       return { error: 'Only completed calls can be rated' };
     }
 
-    const previousRating = call.caller_rating != null ? parseInt(call.caller_rating, 10) : null;
-
     await client.query(
       'UPDATE calls SET caller_rating = $1 WHERE id = $2',
       [rating, callId]
     );
 
-    const { rows: userRows } = await client.query(
-      'SELECT user_rating, user_rating_count FROM users WHERE id = $1 FOR UPDATE',
-      [call.caller_id]
-    );
-    const currentRating = userRows[0]?.user_rating ? parseFloat(userRows[0].user_rating) : 0;
-    const currentCount = userRows[0]?.user_rating_count ?? 0;
-    const ratingCount = previousRating == null ? currentCount + 1 : currentCount;
-    const nextRating = previousRating == null
-      ? Number((((currentRating * currentCount) + rating) / ratingCount).toFixed(2))
-      : Number((((currentRating * currentCount) - previousRating + rating) / Math.max(ratingCount, 1)).toFixed(2));
-
-    await client.query(
-      'UPDATE users SET user_rating = $1, user_rating_count = $2 WHERE id = $3',
-      [nextRating, ratingCount, call.caller_id]
-    );
+    const previousRating = call.caller_rating != null ? parseInt(call.caller_rating, 10) : null;
+    const aggregate = await recalculateCallerAggregateRating(client, call.caller_id);
 
     await client.query('COMMIT');
-    return { success: true, rating: nextRating, ratingCount, updated: previousRating != null };
+    return { success: true, rating: aggregate.rating, ratingCount: aggregate.ratingCount, updated: previousRating != null };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
