@@ -652,12 +652,27 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
       remainingBalance = user?.balance != null ? parseFloat(user.balance) : null;
     }
 
+    let callerRemainingSecondsEstimate = null;
+    if (call.status === 'connected') {
+      const caller = await db.findUserById(call.caller_id);
+      const creator = await db.getCreatorById(call.receiver_id);
+      if (caller && creator) {
+        const ratePerMinute = call.call_type === 'video'
+          ? parseFloat(creator.videoRate || creator.rate || 10)
+          : parseFloat(creator.rate || 10);
+        const callerBalance = caller.balance != null ? parseFloat(caller.balance) : 0;
+        const callerAffordableSeconds = Math.floor(callerBalance / ratePerMinute) * 60;
+        callerRemainingSecondsEstimate = Math.max(callerAffordableSeconds - elapsedSeconds, 0);
+      }
+    }
+
     res.json({
       status: call.status,
       elapsedSeconds,
       duration: call.duration_seconds ?? elapsedSeconds,
       cost: call.total_cost != null ? parseFloat(call.total_cost) : 0,
       remainingBalance,
+      callerRemainingSecondsEstimate,
       callType: call.call_type || 'voice',
       missed: call.status === 'missed',
       ...buildCallTimingPayload(call, serverNowMs),
