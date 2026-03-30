@@ -476,22 +476,56 @@ async function cleanupStaleRingingCalls(timeoutSeconds = RINGING_TIMEOUT_SECONDS
   return rows.length;
 }
 
+async function cleanupSupersededConnectedCalls() {
+  const { rows } = await pool.query(`
+    UPDATE calls c
+    SET status = 'missed',
+        end_time = COALESCE(c.end_time, NOW())
+    WHERE c.status = 'connected'
+      AND EXISTS (
+        SELECT 1
+        FROM calls newer
+        WHERE newer.id != c.id
+          AND newer.created_at > c.created_at
+          AND newer.status IN ('completed', 'missed', 'rejected')
+          AND (
+            c.caller_id IN (newer.caller_id, newer.receiver_id)
+            OR c.receiver_id IN (newer.caller_id, newer.receiver_id)
+          )
+      )
+    RETURNING id
+  `);
+  return rows.length;
+}
+
+async function cleanupExpiredCallStates(timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
+  const staleRinging = await cleanupStaleRingingCalls(timeoutSeconds);
+  const supersededConnected = await cleanupSupersededConnectedCalls();
+  return { staleRinging, supersededConnected };
+}
+
 async function getOngoingCallForUser(userId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
   const { rows } = await pool.query(`
     SELECT *
     FROM calls
-    WHERE (caller_id = $1 OR receiver_id = $1)
-      AND (
-        status = 'connected'
-        OR (
-          status = 'ringing'
-          AND created_at >= NOW() - make_interval(secs => $2)
-        )
-      )
+    WHERE caller_id = $1 OR receiver_id = $1
     ORDER BY created_at DESC
     LIMIT 1
-  `, [userId, timeoutSeconds]);
-  return rows[0] || null;
+  `, [userId]);
+  const latestCall = rows[0] || null;
+  if (!latestCall) {
+    return null;
+  }
+
+  const isActiveRinging =
+    latestCall.status === 'ringing' &&
+    new Date(latestCall.created_at).getTime() >= Date.now() - timeoutSeconds * 1000;
+
+  if (latestCall.status === 'connected' || isActiveRinging) {
+    return latestCall;
+  }
+
+  return null;
 }
 
 async function connectCallById(callId) {
@@ -814,7 +848,7 @@ async function getCreatorDashboard(userId) {
 }
 
 async function getCreatorIncomingCalls(userId) {
-  await cleanupStaleRingingCalls();
+  await cleanupExpiredCallStates();
   const { rows } = await pool.query(`
     SELECT c.id, c.caller_id, c.channel_name, c.call_type, c.status, c.created_at,
            u.name AS caller_name,
@@ -1059,5 +1093,7 @@ module.exports = {
   getUserStatus,
   adminGetSuspendedUsers,
   cleanupStaleRingingCalls,
+  cleanupSupersededConnectedCalls,
+  cleanupExpiredCallStates,
   getOngoingCallForUser,
 };

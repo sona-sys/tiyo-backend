@@ -339,7 +339,7 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId is required' });
 
-    await db.cleanupStaleRingingCalls();
+    await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall || existingCall.receiver_id !== req.userId) {
       return res.status(404).json({ error: 'Call not found' });
@@ -378,7 +378,7 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId is required' });
 
-    await db.cleanupStaleRingingCalls();
+    await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
       return res.status(404).json({ error: 'Call not found' });
@@ -549,7 +549,7 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'This creator is not available' });
     }
 
-    await db.cleanupStaleRingingCalls();
+    await db.cleanupExpiredCallStates();
 
     const callerOngoingCall = await db.getOngoingCallForUser(callerId);
     if (callerOngoingCall) {
@@ -605,7 +605,7 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
   try {
     const { callId } = req.params;
-    await db.cleanupStaleRingingCalls();
+    await db.cleanupExpiredCallStates();
     const call = await db.getCallById(callId);
     if (!call) return res.status(404).json({ error: 'Call not found' });
     if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
@@ -670,7 +670,7 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'callId is required' });
     }
 
-    await db.cleanupStaleRingingCalls();
+    await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
       return res.status(404).json({ error: 'Call not found' });
