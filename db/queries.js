@@ -1,5 +1,5 @@
 const pool = require('./pool');
-const RINGING_TIMEOUT_SECONDS = 45;
+const RINGING_TIMEOUT_SECONDS = 35;
 
 // ─── USERS ──────────────────────────────────────────────
 
@@ -508,45 +508,42 @@ async function getOngoingCallForUser(userId, timeoutSeconds = RINGING_TIMEOUT_SE
   const { rows } = await pool.query(`
     SELECT *
     FROM calls
-    WHERE caller_id = $1 OR receiver_id = $1
+    WHERE (caller_id = $1 OR receiver_id = $1)
+      AND (
+        status = 'connected'
+        OR (
+          status = 'ringing'
+          AND created_at >= NOW() - make_interval(secs => $2)
+        )
+      )
     ORDER BY created_at DESC
     LIMIT 1
-  `, [userId]);
-  const latestCall = rows[0] || null;
-  if (!latestCall) {
-    return null;
-  }
-
-  const isActiveRinging =
-    latestCall.status === 'ringing' &&
-    new Date(latestCall.created_at).getTime() >= Date.now() - timeoutSeconds * 1000;
-
-  if (latestCall.status === 'connected' || isActiveRinging) {
-    return latestCall;
-  }
-
-  return null;
-}
-
-async function connectCallById(callId) {
-  const { rows } = await pool.query(`
-    UPDATE calls SET status = 'connected', start_time = NOW()
-    WHERE id = $1 AND status = 'ringing'
-    RETURNING *
-  `, [callId]);
+  `, [userId, timeoutSeconds]);
   return rows[0] || null;
 }
 
-async function acceptCallById(callId, receiverId) {
+async function connectCallById(callId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
+  const { rows } = await pool.query(`
+    UPDATE calls SET status = 'connected', start_time = NOW()
+    WHERE id = $1
+      AND status = 'ringing'
+      AND created_at >= NOW() - make_interval(secs => $2)
+    RETURNING *
+  `, [callId, timeoutSeconds]);
+  return rows[0] || null;
+}
+
+async function acceptCallById(callId, receiverId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
   const { rows } = await pool.query(`
     UPDATE calls
     SET status = 'connected', start_time = NOW()
     WHERE id = $1
       AND receiver_id = $2
       AND status = 'ringing'
+      AND created_at >= NOW() - make_interval(secs => $3)
       AND end_time IS NULL
     RETURNING *
-  `, [callId, receiverId]);
+  `, [callId, receiverId, timeoutSeconds]);
   return rows[0] || null;
 }
 
@@ -1045,6 +1042,7 @@ async function adminGetSuspendedUsers() {
 }
 
 module.exports = {
+  RINGING_TIMEOUT_SECONDS,
   findUserByPhone,
   findUserById,
   createUser,

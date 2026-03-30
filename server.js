@@ -18,6 +18,23 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CALL_ANSWER_TIMEOUT_MS = db.RINGING_TIMEOUT_SECONDS * 1000;
+
+function sendCallError(res, statusCode, error, reason, extra = {}) {
+  return res.status(statusCode).json({ error, reason, ...extra });
+}
+
+function buildCallTimingPayload(call, serverNowMs = Date.now()) {
+  const createdAtMs = call?.created_at ? new Date(call.created_at).getTime() : null;
+  const startTimeMs = call?.start_time ? new Date(call.start_time).getTime() : null;
+
+  return {
+    serverNowMs,
+    createdAtMs,
+    startTimeMs,
+    answerDeadlineMs: createdAtMs != null ? createdAtMs + CALL_ANSWER_TIMEOUT_MS : null,
+  };
+}
 
 // ─── SECURITY & PERFORMANCE MIDDLEWARE ─────────────────
 app.use(helmet({
@@ -337,21 +354,25 @@ app.get('/api/creators/incoming-calls', requireAuth, async (req, res) => {
 app.post('/api/calls/accept', requireAuth, async (req, res) => {
   try {
     const { callId } = req.body;
-    if (!callId) return res.status(400).json({ error: 'callId is required' });
+    if (!callId) {
+      return sendCallError(res, 400, 'callId is required', 'invalid_request');
+    }
 
     await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall || existingCall.receiver_id !== req.userId) {
-      return res.status(404).json({ error: 'Call not found' });
+      return sendCallError(res, 404, 'Call not found', 'ended');
     }
 
     if (existingCall.status !== 'ringing' || existingCall.end_time) {
-      return res.status(409).json({ error: 'This call has already ended' });
+      return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
 
     // Connect the call (same as /calls/connect but from creator side)
     const call = await db.acceptCallById(callId, req.userId);
-    if (!call) return res.status(409).json({ error: 'This call has already ended' });
+    if (!call) {
+      return sendCallError(res, 409, 'This call has already ended', 'ended');
+    }
 
     // Generate Agora token for the creator
     const tokenData = generateRtcToken(call.channel_name, req.userId);
@@ -366,38 +387,43 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
       agoraToken: tokenData.token,
       agoraUid: req.userId,
       startTime: call.start_time,
+      ...buildCallTimingPayload(call),
     });
   } catch (err) {
     console.error('Accept call error:', err);
-    res.status(500).json({ error: 'Failed to accept call' });
+    sendCallError(res, 500, 'Failed to accept call', 'server_error');
   }
 });
 
 app.post('/api/calls/reject', requireAuth, async (req, res) => {
   try {
     const { callId } = req.body;
-    if (!callId) return res.status(400).json({ error: 'callId is required' });
+    if (!callId) {
+      return sendCallError(res, 400, 'callId is required', 'invalid_request');
+    }
 
     await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
-      return res.status(404).json({ error: 'Call not found' });
+      return sendCallError(res, 404, 'Call not found', 'ended');
     }
     if (existingCall.receiver_id !== req.userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
     if (existingCall.status !== 'ringing' || existingCall.end_time) {
-      return res.status(409).json({ error: 'This call has already ended' });
+      return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
 
     const call = await db.rejectCallById(callId);
-    if (!call) return res.status(409).json({ error: 'This call has already ended' });
+    if (!call) {
+      return sendCallError(res, 409, 'This call has already ended', 'ended');
+    }
 
     console.log(`Call rejected by creator: ${callId}`);
     res.json({ success: true });
   } catch (err) {
     console.error('Reject call error:', err);
-    res.status(500).json({ error: 'Failed to reject call' });
+    sendCallError(res, 500, 'Failed to reject call', 'server_error');
   }
 });
 
@@ -524,41 +550,41 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
     const callerId = req.userId;
 
     if (!receiverId) {
-      return res.status(400).json({ error: 'receiverId is required' });
+      return sendCallError(res, 400, 'receiverId is required', 'invalid_request');
     }
 
     // V38: Check if caller is suspended
     const callerStatus = await db.getUserStatus(callerId);
     if (callerStatus !== 'active') {
-      return res.status(403).json({ error: 'Your account is suspended. Contact support.' });
+      return sendCallError(res, 403, 'Your account is suspended. Contact support.', 'suspended');
     }
 
     const receiver = await db.getCreatorById(receiverId);
     if (!receiver || receiver.role !== 'creator') {
-      return res.status(404).json({ error: 'Creator not found' });
+      return sendCallError(res, 404, 'Creator not found', 'unavailable');
     }
 
     const receiverStatus = await db.getUserStatus(receiverId);
     if (receiverStatus !== 'active' || !receiver.online) {
-      return res.status(409).json({ error: 'This creator is unavailable right now.' });
+      return sendCallError(res, 409, 'This creator is unavailable right now.', 'unavailable');
     }
 
     // V38: Check if caller is blocked by receiver
     const blocked = await db.isBlocked(receiverId, callerId);
     if (blocked) {
-      return res.status(403).json({ error: 'This creator is not available' });
+      return sendCallError(res, 403, 'This creator is not available', 'blocked');
     }
 
     await db.cleanupExpiredCallStates();
 
     const callerOngoingCall = await db.getOngoingCallForUser(callerId);
     if (callerOngoingCall) {
-      return res.status(409).json({ error: 'You already have a call in progress.' });
+      return sendCallError(res, 409, 'You already have a call in progress.', 'busy');
     }
 
     const receiverOngoingCall = await db.getOngoingCallForUser(receiverId);
     if (receiverOngoingCall) {
-      return res.status(409).json({ error: 'This creator is currently on another call.' });
+      return sendCallError(res, 409, 'This creator is currently on another call.', 'busy');
     }
 
     // Generate unique channel name
@@ -594,10 +620,11 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       agoraToken: tokenData.token,
       agoraUid: callerId,
       mockMode: agoraMockMode,
+      ...buildCallTimingPayload(call),
     });
   } catch (err) {
     console.error('Start call error:', err);
-    res.status(500).json({ error: 'Failed to start call' });
+    sendCallError(res, 500, 'Failed to start call', 'server_error');
   }
 });
 
@@ -613,9 +640,10 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
     }
 
     // Include server-side elapsed seconds so both clients can sync timers
+    const serverNowMs = Date.now();
     let elapsedSeconds = 0;
     if (call.start_time && call.status === 'connected') {
-      elapsedSeconds = Math.floor((Date.now() - new Date(call.start_time).getTime()) / 1000);
+      elapsedSeconds = Math.floor((serverNowMs - new Date(call.start_time).getTime()) / 1000);
     }
 
     let remainingBalance = null;
@@ -632,6 +660,7 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
       remainingBalance,
       callType: call.call_type || 'voice',
       missed: call.status === 'missed',
+      ...buildCallTimingPayload(call, serverNowMs),
     });
   } catch (err) {
     console.error('Call status error:', err);
@@ -667,35 +696,40 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
     const { callId } = req.body;
 
     if (!callId) {
-      return res.status(400).json({ error: 'callId is required' });
+      return sendCallError(res, 400, 'callId is required', 'invalid_request');
     }
 
     await db.cleanupExpiredCallStates();
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
-      return res.status(404).json({ error: 'Call not found' });
+      return sendCallError(res, 404, 'Call not found', 'ended');
     }
     if (existingCall.caller_id !== req.userId && existingCall.receiver_id !== req.userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
     if (existingCall.status === 'connected' && existingCall.start_time) {
-      return res.json({ success: true, startTime: existingCall.start_time, alreadyConnected: true });
+      return res.json({
+        success: true,
+        startTime: existingCall.start_time,
+        alreadyConnected: true,
+        ...buildCallTimingPayload(existingCall),
+      });
     }
     if (existingCall.status !== 'ringing' || existingCall.end_time) {
-      return res.status(409).json({ error: 'This call is no longer available' });
+      return sendCallError(res, 409, 'This call is no longer available', 'ended');
     }
 
     const call = await db.connectCallById(callId);
     if (!call) {
-      return res.status(409).json({ error: 'This call is no longer available' });
+      return sendCallError(res, 409, 'This call is no longer available', 'ended');
     }
 
     console.log(`Call connected: ${callId} at ${call.start_time}`);
 
-    res.json({ success: true, startTime: call.start_time });
+    res.json({ success: true, startTime: call.start_time, ...buildCallTimingPayload(call) });
   } catch (err) {
     console.error('Connect call error:', err);
-    res.status(500).json({ error: 'Failed to connect call' });
+    sendCallError(res, 500, 'Failed to connect call', 'server_error');
   }
 });
 
@@ -917,6 +951,14 @@ app.post('/api/admin/users/:id/unsuspend', requireAdmin, async (req, res) => {
 });
 
 // ─── HEALTH CHECK ───────────────────────────────────────
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'pay-to-call-api',
+    time: new Date().toISOString(),
+  });
+});
 
 app.get('/', (req, res) => {
   res.send('Pay-to-Call API is running');
