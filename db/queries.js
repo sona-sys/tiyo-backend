@@ -1,5 +1,6 @@
 const pool = require('./pool');
 const RINGING_TIMEOUT_SECONDS = 35;
+const TERMINAL_REASON_HINTS = new Set(['remote_left', 'network_drop_timeout']);
 
 // ─── USERS ──────────────────────────────────────────────
 
@@ -468,7 +469,9 @@ async function cleanupStaleRingingCalls(timeoutSeconds = RINGING_TIMEOUT_SECONDS
   const { rows } = await pool.query(`
     UPDATE calls
     SET status = 'missed',
-        end_time = COALESCE(end_time, NOW())
+        end_time = COALESCE(end_time, NOW()),
+        end_reason = COALESCE(end_reason, 'no_answer_timeout'),
+        ended_by_user_id = NULL
     WHERE status = 'ringing'
       AND created_at < NOW() - make_interval(secs => $1)
     RETURNING id
@@ -480,7 +483,9 @@ async function cleanupSupersededConnectedCalls() {
   const { rows } = await pool.query(`
     UPDATE calls c
     SET status = 'missed',
-        end_time = COALESCE(c.end_time, NOW())
+        end_time = COALESCE(c.end_time, NOW()),
+        end_reason = COALESCE(c.end_reason, 'system_cleanup'),
+        ended_by_user_id = NULL
     WHERE c.status = 'connected'
       AND EXISTS (
         SELECT 1
@@ -524,7 +529,7 @@ async function getOngoingCallForUser(userId, timeoutSeconds = RINGING_TIMEOUT_SE
 
 async function connectCallById(callId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
   const { rows } = await pool.query(`
-    UPDATE calls SET status = 'connected', start_time = NOW()
+    UPDATE calls SET status = 'connected', start_time = NOW(), end_reason = NULL, ended_by_user_id = NULL
     WHERE id = $1
       AND status = 'ringing'
       AND created_at >= NOW() - make_interval(secs => $2)
@@ -536,7 +541,7 @@ async function connectCallById(callId, timeoutSeconds = RINGING_TIMEOUT_SECONDS)
 async function acceptCallById(callId, receiverId, timeoutSeconds = RINGING_TIMEOUT_SECONDS) {
   const { rows } = await pool.query(`
     UPDATE calls
-    SET status = 'connected', start_time = NOW()
+    SET status = 'connected', start_time = NOW(), end_reason = NULL, ended_by_user_id = NULL
     WHERE id = $1
       AND receiver_id = $2
       AND status = 'ringing'
@@ -552,7 +557,7 @@ async function getCallById(callId) {
   return rows[0] || null;
 }
 
-async function processCallEndById(callId) {
+async function processCallEndById(callId, endedByUserId = null, reasonHint = null) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -564,19 +569,48 @@ async function processCallEndById(callId) {
     if (!callRows[0]) throw new Error('Call not found');
     const call = callRows[0];
 
-    if (call.status === 'completed') {
+    if (call.status === 'completed' || call.status === 'missed' || call.status === 'rejected') {
       await client.query('ROLLBACK');
       return { error: 'Call already ended' };
     }
 
+    const callerInitiated = endedByUserId != null && endedByUserId === call.caller_id;
+    const receiverInitiated = endedByUserId != null && endedByUserId === call.receiver_id;
+    const normalizedReasonHint = TERMINAL_REASON_HINTS.has(reasonHint) ? reasonHint : null;
+
     // If call never connected, mark as missed — no charge
     if (call.status === 'ringing' || !call.start_time) {
+      let nextStatus = 'missed';
+      let endReason = 'caller_cancelled_before_answer';
+      let terminalEndedByUserId = callerInitiated ? endedByUserId : null;
+
+      if (receiverInitiated) {
+        nextStatus = 'rejected';
+        endReason = 'creator_declined';
+        terminalEndedByUserId = endedByUserId;
+      }
+
       await client.query(
-        `UPDATE calls SET status = 'missed', end_time = NOW() WHERE id = $1`,
-        [callId]
+        `UPDATE calls
+         SET status = $2,
+             end_time = NOW(),
+             end_reason = $3,
+             ended_by_user_id = $4
+         WHERE id = $1`,
+        [callId, nextStatus, endReason, terminalEndedByUserId]
       );
       await client.query('COMMIT');
-      return { success: true, cost: 0, duration: 0, remainingBalance: null, missed: true };
+      return {
+        success: true,
+        status: nextStatus,
+        cost: 0,
+        duration: 0,
+        remainingBalance: null,
+        missed: nextStatus === 'missed',
+        endReason,
+        endedByUserId: terminalEndedByUserId,
+        callType: call.call_type || 'voice',
+      };
     }
 
     // Server calculates duration from start_time
@@ -616,11 +650,19 @@ async function processCallEndById(callId) {
       [chargeAmount, call.receiver_id]
     );
 
+    const endReason = normalizedReasonHint
+      || (callerInitiated
+        ? 'caller_hangup'
+        : receiverInitiated
+          ? 'creator_hangup'
+          : 'system_cleanup');
+    const terminalEndedByUserId = normalizedReasonHint ? null : (callerInitiated || receiverInitiated ? endedByUserId : null);
+
     await client.query(`
       UPDATE calls SET status = 'completed', end_time = NOW(),
-        duration_seconds = $1, total_cost = $2
-      WHERE id = $3
-    `, [durationSeconds, chargeAmount, callId]);
+        duration_seconds = $1, total_cost = $2, end_reason = $3, ended_by_user_id = $4
+      WHERE id = $5
+    `, [durationSeconds, chargeAmount, endReason, terminalEndedByUserId, callId]);
 
     // Record transaction for caller (debit)
     await client.query(
@@ -638,9 +680,13 @@ async function processCallEndById(callId) {
 
     return {
       success: true,
+      status: 'completed',
       duration: durationSeconds,
       cost: chargeAmount,
       remainingBalance: parseFloat(updatedWallet[0].balance),
+      endReason,
+      endedByUserId: terminalEndedByUserId,
+      callType: call.call_type || 'voice',
     };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -862,12 +908,16 @@ async function getCreatorIncomingCalls(userId) {
   }));
 }
 
-async function rejectCallById(callId) {
+async function rejectCallById(callId, receiverId = null) {
   const { rows } = await pool.query(`
-    UPDATE calls SET status = 'rejected', end_time = NOW()
+    UPDATE calls
+    SET status = 'rejected',
+        end_time = NOW(),
+        end_reason = 'creator_declined',
+        ended_by_user_id = $2
     WHERE id = $1 AND status = 'ringing'
     RETURNING *
-  `, [callId]);
+  `, [callId, receiverId]);
   return rows[0] || null;
 }
 
@@ -934,6 +984,7 @@ async function adminGetCreators() {
 async function adminGetCalls(limit = 50, offset = 0) {
   const { rows } = await pool.query(`
     SELECT c.id, c.call_type, c.status, c.duration_seconds, c.total_cost, c.created_at,
+           c.end_reason AS "endReason", c.ended_by_user_id AS "endedByUserId",
            caller.name AS caller_name, caller.phone AS caller_phone,
            receiver.name AS receiver_name, receiver.phone AS receiver_phone
     FROM calls c
@@ -1094,4 +1145,5 @@ module.exports = {
   cleanupSupersededConnectedCalls,
   cleanupExpiredCallStates,
   getOngoingCallForUser,
+  TERMINAL_REASON_HINTS,
 };

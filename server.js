@@ -36,6 +36,13 @@ function buildCallTimingPayload(call, serverNowMs = Date.now()) {
   };
 }
 
+function buildCallTerminalPayload(call) {
+  return {
+    endReason: call?.end_reason || null,
+    endedByUserId: call?.ended_by_user_id ?? null,
+  };
+}
+
 // ─── SECURITY & PERFORMANCE MIDDLEWARE ─────────────────
 app.use(helmet({
   contentSecurityPolicy: {
@@ -414,7 +421,7 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
 
-    const call = await db.rejectCallById(callId);
+    const call = await db.rejectCallById(callId, req.userId);
     if (!call) {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
@@ -675,6 +682,7 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
       callerRemainingSecondsEstimate,
       callType: call.call_type || 'voice',
       missed: call.status === 'missed',
+      ...buildCallTerminalPayload(call),
       ...buildCallTimingPayload(call, serverNowMs),
     });
   } catch (err) {
@@ -751,28 +759,32 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
 // Step 4: End call — server calculates duration + cost
 app.post('/api/calls/end', requireAuth, async (req, res) => {
   try {
-    const { callId } = req.body;
+    const { callId, reasonHint = null } = req.body;
 
     if (!callId) {
-      return res.status(400).json({ error: 'callId is required' });
+      return sendCallError(res, 400, 'callId is required', 'invalid_request');
+    }
+
+    if (reasonHint && !db.TERMINAL_REASON_HINTS.has(reasonHint)) {
+      return sendCallError(res, 400, 'Unsupported reasonHint', 'invalid_request');
     }
 
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
-      return res.status(404).json({ error: 'Call not found' });
+      return sendCallError(res, 404, 'Call not found', 'ended');
     }
     if (existingCall.caller_id !== req.userId && existingCall.receiver_id !== req.userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
 
-    const result = await db.processCallEndById(callId);
+    const result = await db.processCallEndById(callId, req.userId, reasonHint);
     if (result.error) {
-      return res.status(400).json({ error: result.error });
+      return sendCallError(res, 400, result.error, 'ended');
     }
     return res.json(result);
   } catch (err) {
     console.error('End call error:', err);
-    res.status(500).json({ error: 'Server error' });
+    sendCallError(res, 500, 'Server error', 'server_error');
   }
 });
 

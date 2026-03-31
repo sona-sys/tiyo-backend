@@ -262,18 +262,25 @@
     let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
     html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Caller</th><th class="px-4 py-3">Creator</th>';
     html += '<th class="px-4 py-3">Type</th><th class="px-4 py-3">Status</th>';
+    html += '<th class="px-4 py-3">End Reason</th><th class="px-4 py-3">Ended By</th>';
     html += '<th class="px-4 py-3">Duration</th><th class="px-4 py-3">Cost</th>';
     html += '<th class="px-4 py-3">Date</th></tr></thead><tbody>';
     calls.forEach(c => {
       const typeBadge = c.call_type === 'video'
         ? '<span class="text-teal text-xs font-medium">Video</span>'
         : '<span class="text-accent text-xs font-medium">Voice</span>';
+      const endReason = c.endReason
+        ? c.endReason.replaceAll('_', ' ')
+        : 'Legacy/Unknown';
+      const endedBy = c.endedByUserId != null ? ('#' + c.endedByUserId) : '—';
       html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
       html += '<td class="px-4 py-3 text-sm text-gray-400">' + c.id + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + (c.caller_name || c.caller_phone || '—') + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + (c.receiver_name || c.receiver_phone || '—') + '</td>';
       html += '<td class="px-4 py-3">' + typeBadge + '</td>';
       html += '<td class="px-4 py-3">' + statusBadge(c.status) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">' + endReason + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + endedBy + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + fmtDuration(c.duration_seconds) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-green-400">' + (c.total_cost > 0 ? '₹' + c.total_cost.toFixed(0) : '—') + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(c.created_at) + '</td>';
