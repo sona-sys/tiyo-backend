@@ -984,6 +984,7 @@ async function adminGetCreators() {
 async function adminGetCalls(limit = 50, offset = 0) {
   const { rows } = await pool.query(`
     SELECT c.id, c.call_type, c.status, c.duration_seconds, c.total_cost, c.created_at,
+           c.caller_id, c.receiver_id,
            c.end_reason AS "endReason", c.ended_by_user_id AS "endedByUserId",
            caller.name AS caller_name, caller.phone AS caller_phone,
            receiver.name AS receiver_name, receiver.phone AS receiver_phone

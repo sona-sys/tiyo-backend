@@ -212,6 +212,99 @@
     return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + cls + '">' + (status || '—') + '</span>';
   }
 
+  function humanizeReason(reason) {
+    if (!reason) return 'Legacy/Unknown';
+    const labels = {
+      caller_cancelled_before_answer: 'Caller Cancelled Before Answer',
+      creator_declined: 'Creator Declined',
+      no_answer_timeout: 'No Answer Timeout',
+      caller_hangup: 'Caller Hung Up',
+      creator_hangup: 'Creator Hung Up',
+      remote_left: 'Remote Left',
+      network_drop_timeout: 'Network Drop Timeout',
+      system_cleanup: 'System Cleanup',
+    };
+    return labels[reason] || reason.replaceAll('_', ' ');
+  }
+
+  function endReasonBadge(reason) {
+    if (!reason) {
+      return '<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-dark-700 text-gray-400">Legacy/Unknown</span>';
+    }
+
+    const colors = {
+      caller_cancelled_before_answer: 'bg-orange-900 text-orange-300',
+      creator_declined: 'bg-red-900 text-red-300',
+      no_answer_timeout: 'bg-yellow-900 text-yellow-300',
+      caller_hangup: 'bg-blue-900 text-blue-300',
+      creator_hangup: 'bg-purple-900 text-purple-300',
+      remote_left: 'bg-cyan-900 text-cyan-300',
+      network_drop_timeout: 'bg-amber-900 text-amber-300',
+      system_cleanup: 'bg-gray-700 text-gray-300',
+    };
+
+    const cls = colors[reason] || 'bg-dark-700 text-gray-300';
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + cls + '">' + humanizeReason(reason) + '</span>';
+  }
+
+  function endedByLabel(call) {
+    if (!call || call.endedByUserId == null) {
+      return '<span class="text-gray-500">System</span>';
+    }
+
+    if (call.endedByUserId === call.caller_id) {
+      return 'Caller <span class="text-gray-500">#' + call.endedByUserId + '</span>';
+    }
+
+    if (call.endedByUserId === call.receiver_id) {
+      return 'Creator <span class="text-gray-500">#' + call.endedByUserId + '</span>';
+    }
+
+    return '#' + call.endedByUserId;
+  }
+
+  function renderCallsSummary(calls) {
+    const reasonCounts = {};
+    let legacyCount = 0;
+
+    calls.forEach(c => {
+      if (!c.endReason) {
+        legacyCount += 1;
+        return;
+      }
+      reasonCounts[c.endReason] = (reasonCounts[c.endReason] || 0) + 1;
+    });
+
+    const orderedReasons = Object.entries(reasonCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6);
+
+    const chips = orderedReasons.map(([reason, count]) =>
+      '<div class="bg-dark-700 rounded-xl px-3 py-2 min-w-[160px]">' +
+        '<div class="text-xs text-gray-500">End reason</div>' +
+        '<div class="text-sm font-semibold text-white mt-1">' + humanizeReason(reason) + '</div>' +
+        '<div class="text-xs text-gray-400 mt-1">' + count + ' call' + (count === 1 ? '' : 's') + '</div>' +
+      '</div>'
+    );
+
+    if (legacyCount > 0) {
+      chips.push(
+        '<div class="bg-dark-700 rounded-xl px-3 py-2 min-w-[160px]">' +
+          '<div class="text-xs text-gray-500">Legacy rows</div>' +
+          '<div class="text-sm font-semibold text-white mt-1">Unknown end reason</div>' +
+          '<div class="text-xs text-gray-400 mt-1">' + legacyCount + ' call' + (legacyCount === 1 ? '' : 's') + '</div>' +
+        '</div>'
+      );
+    }
+
+    return (
+      '<div class="p-4 border-b border-dark-700">' +
+        '<div class="text-sm text-gray-400 mb-3">Diagnostics on the ' + calls.length + ' most recent calls</div>' +
+        '<div class="flex gap-3 overflow-x-auto">' + chips.join('') + '</div>' +
+      '</div>'
+    );
+  }
+
   function renderUsersTable(users) {
     let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
     html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Name</th><th class="px-4 py-3">Phone</th>';
@@ -259,7 +352,8 @@
   }
 
   function renderCallsTable(calls) {
-    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    let html = renderCallsSummary(calls);
+    html += '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
     html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">Caller</th><th class="px-4 py-3">Creator</th>';
     html += '<th class="px-4 py-3">Type</th><th class="px-4 py-3">Status</th>';
     html += '<th class="px-4 py-3">End Reason</th><th class="px-4 py-3">Ended By</th>';
@@ -269,18 +363,14 @@
       const typeBadge = c.call_type === 'video'
         ? '<span class="text-teal text-xs font-medium">Video</span>'
         : '<span class="text-accent text-xs font-medium">Voice</span>';
-      const endReason = c.endReason
-        ? c.endReason.replaceAll('_', ' ')
-        : 'Legacy/Unknown';
-      const endedBy = c.endedByUserId != null ? ('#' + c.endedByUserId) : '—';
       html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
       html += '<td class="px-4 py-3 text-sm text-gray-400">' + c.id + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + (c.caller_name || c.caller_phone || '—') + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + (c.receiver_name || c.receiver_phone || '—') + '</td>';
       html += '<td class="px-4 py-3">' + typeBadge + '</td>';
       html += '<td class="px-4 py-3">' + statusBadge(c.status) + '</td>';
-      html += '<td class="px-4 py-3 text-sm text-gray-300">' + endReason + '</td>';
-      html += '<td class="px-4 py-3 text-sm text-gray-400">' + endedBy + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">' + endReasonBadge(c.endReason) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">' + endedByLabel(c) + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + fmtDuration(c.duration_seconds) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-green-400">' + (c.total_cost > 0 ? '₹' + c.total_cost.toFixed(0) : '—') + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(c.created_at) + '</td>';
