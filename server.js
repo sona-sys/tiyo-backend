@@ -19,7 +19,6 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CALL_ANSWER_TIMEOUT_MS = db.RINGING_TIMEOUT_SECONDS * 1000;
-const TERMINAL_CALL_STATUSES = new Set(['completed', 'missed', 'rejected']);
 
 function sendCallError(res, statusCode, error, reason, extra = {}) {
   return res.status(statusCode).json({ error, reason, ...extra });
@@ -41,48 +40,6 @@ function buildCallTerminalPayload(call) {
   return {
     endReason: call?.end_reason || null,
     endedByUserId: call?.ended_by_user_id ?? null,
-  };
-}
-
-async function buildCallStatusResponse(call, requesterUserId, extra = {}) {
-  const serverNowMs = Date.now();
-  let elapsedSeconds = 0;
-  if (call.start_time && call.status === 'connected') {
-    elapsedSeconds = Math.floor((serverNowMs - new Date(call.start_time).getTime()) / 1000);
-  }
-
-  let remainingBalance = null;
-  if (TERMINAL_CALL_STATUSES.has(call.status)) {
-    const user = await db.findUserById(requesterUserId);
-    remainingBalance = user?.balance != null ? parseFloat(user.balance) : null;
-  }
-
-  let callerRemainingSecondsEstimate = null;
-  if (call.status === 'connected') {
-    const caller = await db.findUserById(call.caller_id);
-    const creator = await db.getCreatorById(call.receiver_id);
-    if (caller && creator) {
-      const ratePerMinute = call.call_type === 'video'
-        ? parseFloat(creator.videoRate || creator.rate || 10)
-        : parseFloat(creator.rate || 10);
-      const callerBalance = caller.balance != null ? parseFloat(caller.balance) : 0;
-      const callerAffordableSeconds = Math.floor(callerBalance / ratePerMinute) * 60;
-      callerRemainingSecondsEstimate = Math.max(callerAffordableSeconds - elapsedSeconds, 0);
-    }
-  }
-
-  return {
-    status: call.status,
-    elapsedSeconds,
-    duration: call.duration_seconds ?? elapsedSeconds,
-    cost: call.total_cost != null ? parseFloat(call.total_cost) : 0,
-    remainingBalance,
-    callerRemainingSecondsEstimate,
-    callType: call.call_type || 'voice',
-    missed: call.status === 'missed',
-    ...buildCallTerminalPayload(call),
-    ...buildCallTimingPayload(call, serverNowMs),
-    ...extra,
   };
 }
 
@@ -460,24 +417,17 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
     if (existingCall.receiver_id !== req.userId) {
       return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
-    if (TERMINAL_CALL_STATUSES.has(existingCall.status) || existingCall.end_time) {
-      return res.json(await buildCallStatusResponse(existingCall, req.userId, { success: true }));
-    }
-    if (existingCall.status !== 'ringing') {
+    if (existingCall.status !== 'ringing' || existingCall.end_time) {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
 
     const call = await db.rejectCallById(callId, req.userId);
     if (!call) {
-      const latestCall = await db.getCallById(callId);
-      if (latestCall && (TERMINAL_CALL_STATUSES.has(latestCall.status) || latestCall.end_time)) {
-        return res.json(await buildCallStatusResponse(latestCall, req.userId, { success: true }));
-      }
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
 
     console.log(`Call rejected by creator: ${callId}`);
-    res.json(await buildCallStatusResponse(call, req.userId, { success: true }));
+    res.json({ success: true });
   } catch (err) {
     console.error('Reject call error:', err);
     sendCallError(res, 500, 'Failed to reject call', 'server_error');
@@ -695,7 +645,46 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
     if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    res.json(await buildCallStatusResponse(call, req.userId));
+
+    // Include server-side elapsed seconds so both clients can sync timers
+    const serverNowMs = Date.now();
+    let elapsedSeconds = 0;
+    if (call.start_time && call.status === 'connected') {
+      elapsedSeconds = Math.floor((serverNowMs - new Date(call.start_time).getTime()) / 1000);
+    }
+
+    let remainingBalance = null;
+    if (call.status === 'completed' || call.status === 'missed' || call.status === 'rejected') {
+      const user = await db.findUserById(req.userId);
+      remainingBalance = user?.balance != null ? parseFloat(user.balance) : null;
+    }
+
+    let callerRemainingSecondsEstimate = null;
+    if (call.status === 'connected') {
+      const caller = await db.findUserById(call.caller_id);
+      const creator = await db.getCreatorById(call.receiver_id);
+      if (caller && creator) {
+        const ratePerMinute = call.call_type === 'video'
+          ? parseFloat(creator.videoRate || creator.rate || 10)
+          : parseFloat(creator.rate || 10);
+        const callerBalance = caller.balance != null ? parseFloat(caller.balance) : 0;
+        const callerAffordableSeconds = Math.floor(callerBalance / ratePerMinute) * 60;
+        callerRemainingSecondsEstimate = Math.max(callerAffordableSeconds - elapsedSeconds, 0);
+      }
+    }
+
+    res.json({
+      status: call.status,
+      elapsedSeconds,
+      duration: call.duration_seconds ?? elapsedSeconds,
+      cost: call.total_cost != null ? parseFloat(call.total_cost) : 0,
+      remainingBalance,
+      callerRemainingSecondsEstimate,
+      callType: call.call_type || 'voice',
+      missed: call.status === 'missed',
+      ...buildCallTerminalPayload(call),
+      ...buildCallTimingPayload(call, serverNowMs),
+    });
   } catch (err) {
     console.error('Call status error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -787,16 +776,9 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
     if (existingCall.caller_id !== req.userId && existingCall.receiver_id !== req.userId) {
       return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
-    if (TERMINAL_CALL_STATUSES.has(existingCall.status) || existingCall.end_time) {
-      return res.json(await buildCallStatusResponse(existingCall, req.userId, { success: true }));
-    }
 
     const result = await db.processCallEndById(callId, req.userId, reasonHint);
     if (result.error) {
-      const latestCall = await db.getCallById(callId);
-      if (latestCall && (TERMINAL_CALL_STATUSES.has(latestCall.status) || latestCall.end_time)) {
-        return res.json(await buildCallStatusResponse(latestCall, req.userId, { success: true }));
-      }
       return sendCallError(res, 400, result.error, 'ended');
     }
     return res.json(result);
