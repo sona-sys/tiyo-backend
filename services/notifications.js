@@ -103,25 +103,17 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
 
   const message = {
     token: pushToken,
-    notification: {
+    data: serializeData({
       title,
-      body,
-    },
-    data: serializeData(data),
+      message: body,
+      channelId: 'incoming-calls',
+      sticky: true,
+      autoDismiss: false,
+      ...data,
+    }),
     android: {
       priority: 'high',
       ttl: 35000,
-      notification: {
-        channelId: 'incoming-calls',
-        priority: 'max',
-        sound: 'default',
-        visibility: 'public',
-        tag: data.callId ? `incoming-call-${data.callId}` : 'incoming-call',
-        sticky: true,
-        localOnly: true,
-        defaultVibrateTimings: true,
-        eventTimestamp: new Date(),
-      },
     },
   };
 
