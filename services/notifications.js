@@ -116,6 +116,11 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
         priority: 'max',
         sound: 'default',
         visibility: 'public',
+        tag: data.callId ? `incoming-call-${data.callId}` : 'incoming-call',
+        sticky: true,
+        localOnly: true,
+        defaultVibrateTimings: true,
+        eventTimestamp: new Date(),
       },
     },
   };
@@ -160,11 +165,14 @@ async function sendCallNotificationToCreator({
     return null;
   }
 
+  const displayName = callerName || 'Someone';
+  const callLabel = callType === 'video' ? 'Video call' : 'Voice call';
+
   return sendPushNotification({
     userId: creatorUserId,
     pushToken,
-    title: 'Incoming Call',
-    body: `${callerName || 'Someone'} is calling you`,
+    title: `${callLabel} from ${displayName}`,
+    body: 'Tap to answer in TIYO',
     data: {
       type: 'incoming_call',
       callId,
