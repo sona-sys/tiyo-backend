@@ -106,7 +106,7 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
     data: serializeData({
       title,
       message: body,
-      channelId: 'incoming-calls',
+      channelId: 'incoming-calls-v2',
       sticky: true,
       autoDismiss: false,
       ...data,
