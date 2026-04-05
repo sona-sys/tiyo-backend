@@ -175,6 +175,7 @@ async function sendCallNotificationToCreator({
     body: 'Tap to answer in TIYO',
     data: {
       type: 'incoming_call',
+      categoryId: 'incomingCall',
       callId,
       channelName,
       callerId,
