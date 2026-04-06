@@ -5,6 +5,9 @@ const pool = require('../db/pool');
 let firebaseApp = null;
 let loggedMissingConfig = false;
 let loggedInitFailure = false;
+const FALLBACK_DELAY_MS = 4000;
+const pendingIncomingCallFallbacks = new Map();
+const deliveredIncomingCallAlerts = new Set();
 
 function normalizePrivateKey(value) {
   return typeof value === 'string' ? value.replace(/\\n/g, '\n') : value;
@@ -91,7 +94,15 @@ async function clearStoredPushToken(userId) {
   }
 }
 
-async function sendPushNotification({ userId = null, pushToken, title, body, data = {} }) {
+async function sendPushNotification({
+  userId = null,
+  pushToken,
+  title,
+  body,
+  data = {},
+  notification = null,
+  android = null,
+}) {
   if (!pushToken || typeof pushToken !== 'string') {
     return null;
   }
@@ -111,9 +122,11 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
       autoDismiss: false,
       ...data,
     }),
+    ...(notification ? { notification } : {}),
     android: {
       priority: 'high',
       ttl: data?.type === 'incoming_call' ? 0 : 35000,
+      ...(android || {}),
     },
   };
 
@@ -135,6 +148,125 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
 
     return null;
   }
+}
+
+async function isCallStillRinging(callId) {
+  if (!callId) {
+    return false;
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT status FROM calls WHERE id = $1', [callId]);
+    return rows[0]?.status === 'ringing';
+  } catch (err) {
+    console.error(`Failed to check call ${callId} for fallback delivery:`, err.message);
+    return false;
+  }
+}
+
+function clearIncomingCallFallback(callId) {
+  const normalizedCallId = Number(callId);
+  if (!normalizedCallId) {
+    return;
+  }
+
+  const pendingTimer = pendingIncomingCallFallbacks.get(normalizedCallId);
+  if (pendingTimer) {
+    clearTimeout(pendingTimer);
+    pendingIncomingCallFallbacks.delete(normalizedCallId);
+  }
+  deliveredIncomingCallAlerts.delete(normalizedCallId);
+}
+
+function markIncomingCallAlertDelivered(callId) {
+  const normalizedCallId = Number(callId);
+  if (!normalizedCallId) {
+    return;
+  }
+
+  deliveredIncomingCallAlerts.add(normalizedCallId);
+  const pendingTimer = pendingIncomingCallFallbacks.get(normalizedCallId);
+  if (pendingTimer) {
+    clearTimeout(pendingTimer);
+    pendingIncomingCallFallbacks.delete(normalizedCallId);
+  }
+}
+
+function scheduleIncomingCallFallback({
+  creatorUserId,
+  pushToken,
+  callerId = null,
+  callerName,
+  callerRating = 0,
+  callerRatingCount = 0,
+  callId,
+  channelName,
+  callType = 'voice',
+}) {
+  const normalizedCallId = Number(callId);
+  if (!normalizedCallId || !pushToken) {
+    return;
+  }
+
+  clearIncomingCallFallback(normalizedCallId);
+
+  const timer = setTimeout(async () => {
+    pendingIncomingCallFallbacks.delete(normalizedCallId);
+
+    if (deliveredIncomingCallAlerts.has(normalizedCallId)) {
+      return;
+    }
+
+    const stillRinging = await isCallStillRinging(normalizedCallId);
+    if (!stillRinging) {
+      clearIncomingCallFallback(normalizedCallId);
+      return;
+    }
+
+    const displayName = callerName || 'Someone';
+    const callLabel = callType === 'video' ? 'Video call' : 'Voice call';
+
+    await sendPushNotification({
+      userId: creatorUserId,
+      pushToken,
+      title: `${callLabel} from ${displayName}`,
+      body: 'Tap to answer in TIYO',
+      data: {
+        type: 'incoming_call',
+        callId: normalizedCallId,
+        channelName,
+        callerId,
+        callerName: callerName || 'User',
+        callerRating,
+        callerRatingCount,
+        callType,
+        channelId: 'incoming-calls-v2',
+        sticky: false,
+        autoDismiss: true,
+        fallbackMode: 'system_notification',
+      },
+      android: {
+        priority: 'high',
+        ttl: 0,
+        collapseKey: `incoming-call-${normalizedCallId}`,
+        notification: {
+          channelId: 'incoming-calls-v2',
+          tag: `incoming-call-${normalizedCallId}`,
+          clickAction: 'DEFAULT',
+          sound: 'default',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          visibility: 'public',
+        },
+      },
+      notification: {
+        title: `${callLabel} from ${displayName}`,
+        body: 'Tap to answer in TIYO',
+      },
+    });
+  }, FALLBACK_DELAY_MS);
+
+  pendingIncomingCallFallbacks.set(normalizedCallId, timer);
 }
 
 async function sendCallNotificationToCreator({
@@ -160,7 +292,7 @@ async function sendCallNotificationToCreator({
   const displayName = callerName || 'Someone';
   const callLabel = callType === 'video' ? 'Video call' : 'Voice call';
 
-  return sendPushNotification({
+  const result = await sendPushNotification({
     userId: creatorUserId,
     pushToken,
     title: `${callLabel} from ${displayName}`,
@@ -177,6 +309,25 @@ async function sendCallNotificationToCreator({
       callType,
     },
   });
+
+  scheduleIncomingCallFallback({
+    creatorUserId,
+    pushToken,
+    callerId,
+    callerName,
+    callerRating,
+    callerRatingCount,
+    callId,
+    channelName,
+    callType,
+  });
+
+  return result;
 }
 
-module.exports = { sendPushNotification, sendCallNotificationToCreator };
+module.exports = {
+  sendPushNotification,
+  sendCallNotificationToCreator,
+  clearIncomingCallFallback,
+  markIncomingCallAlertDelivered,
+};

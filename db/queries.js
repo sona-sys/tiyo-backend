@@ -789,7 +789,7 @@ async function registerCreator(userId, { rate, videoRate, bio, languages, catego
     const vidRate = videoRate || Math.round(voiceRate * 1.5); // default video rate is 1.5x voice
     await client.query(`
       INSERT INTO creators (user_id, rate, video_rate, languages, categories, is_online)
-      VALUES ($1, $2, $3, $4, $5, true)
+      VALUES ($1, $2, $3, $4, $5, false)
       ON CONFLICT (user_id) DO UPDATE SET
         rate = EXCLUDED.rate,
         video_rate = EXCLUDED.video_rate,

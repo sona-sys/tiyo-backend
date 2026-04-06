@@ -12,7 +12,11 @@ const { generateToken, requireAuth, optionalAuth } = require('./middleware/auth'
 const { sendOTP, verifyOTP } = require('./auth/supabase');
 const { RAZORPAY_KEY_ID, createOrder, verifyPaymentSignature } = require('./payments/razorpay');
 const { AGORA_APP_ID, isMockMode: agoraMockMode, generateRtcToken, generateChannelName } = require('./calling/agora');
-const { sendCallNotificationToCreator } = require('./services/notifications');
+const {
+  sendCallNotificationToCreator,
+  clearIncomingCallFallback,
+  markIncomingCallAlertDelivered,
+} = require('./services/notifications');
 const { requireAdmin } = require('./middleware/adminAuth');
 const path = require('path');
 
@@ -337,6 +341,30 @@ app.post('/api/creators/toggle-availability', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/calls/:callId/alert-received', requireAuth, async (req, res) => {
+  try {
+    const callId = parseInt(req.params.callId, 10);
+    if (!Number.isInteger(callId)) {
+      return sendCallError(res, 400, 'Valid callId is required', 'invalid_request');
+    }
+
+    const call = await db.getCallById(callId);
+    if (!call) {
+      return sendCallError(res, 404, 'Call not found', 'ended');
+    }
+
+    if (call.receiver_id !== req.userId) {
+      return sendCallError(res, 403, 'Access denied', 'access_denied');
+    }
+
+    markIncomingCallAlertDelivered(callId);
+    res.json({ success: true, status: call.status });
+  } catch (err) {
+    console.error('Incoming call alert ack error:', err);
+    sendCallError(res, 500, 'Server error', 'server_error');
+  }
+});
+
 app.get('/api/creators/dashboard', requireAuth, async (req, res) => {
   try {
     const dashboard = await db.getCreatorDashboard(req.userId);
@@ -380,6 +408,7 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
     if (!call) {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
+    clearIncomingCallFallback(call.id);
 
     // Generate Agora token for the creator
     const tokenData = generateRtcToken(call.channel_name, req.userId);
@@ -425,6 +454,7 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
     if (!call) {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
+    clearIncomingCallFallback(call.id);
 
     console.log(`Call rejected by creator: ${callId}`);
     res.json({ success: true });
@@ -645,6 +675,9 @@ app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
     if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
+    if (call.status === 'completed' || call.status === 'missed' || call.status === 'rejected') {
+      clearIncomingCallFallback(call.id);
+    }
 
     // Include server-side elapsed seconds so both clients can sync timers
     const serverNowMs = Date.now();
@@ -731,6 +764,7 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
       return sendCallError(res, 403, 'Access denied', 'access_denied');
     }
     if (existingCall.status === 'connected' && existingCall.start_time) {
+      clearIncomingCallFallback(existingCall.id);
       return res.json({
         success: true,
         startTime: existingCall.start_time,
@@ -746,6 +780,7 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
     if (!call) {
       return sendCallError(res, 409, 'This call is no longer available', 'ended');
     }
+    clearIncomingCallFallback(call.id);
 
     console.log(`Call connected: ${callId} at ${call.start_time}`);
 
@@ -781,6 +816,7 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
     if (result.error) {
       return sendCallError(res, 400, result.error, 'ended');
     }
+    clearIncomingCallFallback(callId);
     return res.json(result);
   } catch (err) {
     console.error('End call error:', err);
