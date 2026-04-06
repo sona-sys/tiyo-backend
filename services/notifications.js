@@ -113,7 +113,7 @@ async function sendPushNotification({ userId = null, pushToken, title, body, dat
     }),
     android: {
       priority: 'high',
-      ttl: 35000,
+      ttl: data?.type === 'incoming_call' ? 0 : 35000,
     },
   };
 
