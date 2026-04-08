@@ -341,6 +341,22 @@ app.post('/api/creators/toggle-availability', requireAuth, async (req, res) => {
   }
 });
 
+app.put('/api/creators/availability', requireAuth, async (req, res) => {
+  try {
+    const { isOnline } = req.body || {};
+    if (typeof isOnline !== 'boolean') {
+      return res.status(400).json({ error: 'isOnline boolean is required' });
+    }
+
+    const result = await db.setCreatorAvailability(req.userId, isOnline);
+    if (!result) return res.status(404).json({ error: 'Creator not found' });
+    res.json({ success: true, isOnline: result.is_online });
+  } catch (err) {
+    console.error('Set availability error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/calls/:callId/alert-received', requireAuth, async (req, res) => {
   try {
     const callId = parseInt(req.params.callId, 10);

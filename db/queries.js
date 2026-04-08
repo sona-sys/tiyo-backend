@@ -849,6 +849,15 @@ async function toggleCreatorAvailability(userId) {
   return rows[0] || null;
 }
 
+async function setCreatorAvailability(userId, isOnline) {
+  const { rows } = await pool.query(`
+    UPDATE creators SET is_online = $1, last_seen = NOW()
+    WHERE user_id = $2
+    RETURNING is_online
+  `, [isOnline, userId]);
+  return rows[0] || null;
+}
+
 async function getCreatorDashboard(userId) {
   // Get creator stats
   const { rows: creatorRows } = await pool.query(`
@@ -1123,6 +1132,7 @@ module.exports = {
   registerCreator,
   updateCreatorProfile,
   toggleCreatorAvailability,
+  setCreatorAvailability,
   getCreatorDashboard,
   getCreatorIncomingCalls,
   rejectCallById,
