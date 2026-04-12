@@ -70,6 +70,19 @@ async function updateUserHandle(id, handle) {
   return rows[0] || null;
 }
 
+async function isHandleAvailable(handle, excludeUserId = null) {
+  const normalizedHandle = String(handle || '').trim().toLowerCase();
+  if (!normalizedHandle) {
+    return false;
+  }
+
+  const { rows } = await pool.query(
+    'SELECT id FROM users WHERE handle = $1 AND ($2::int IS NULL OR id != $2) LIMIT 1',
+    [normalizedHandle, excludeUserId]
+  );
+  return rows.length === 0;
+}
+
 // ─── CREATORS ───────────────────────────────────────────
 
 async function getCreators(requestingUserId = null) {
@@ -83,7 +96,7 @@ async function getCreators(requestingUserId = null) {
     WHERE u.role = 'creator' AND u.name IS NOT NULL AND u.name != ''
       AND u.status = 'active'
       AND ($1::int IS NULL OR u.id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = $1))
-    ORDER BY u.id
+    ORDER BY c.is_online DESC, c.rating DESC NULLS LAST, u.id
   `, [requestingUserId]);
   return rows;
 }
@@ -773,7 +786,7 @@ async function savePushToken(userId, pushToken) {
 
 // ─── CREATOR REGISTRATION & MANAGEMENT (V32) ──────────
 
-async function registerCreator(userId, { rate, videoRate, bio, languages, categories }) {
+async function registerCreator(userId, { bio, languages, categories }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -784,9 +797,9 @@ async function registerCreator(userId, { rate, videoRate, bio, languages, catego
       [bio || null, userId]
     );
 
-    // Insert into creators table with separate voice and video rates
-    const voiceRate = rate || 10;
-    const vidRate = videoRate || Math.round(voiceRate * 1.5); // default video rate is 1.5x voice
+    // Rates are assigned server-side for now. The app no longer asks creators to pick them.
+    const voiceRate = 10;
+    const vidRate = 15;
     await client.query(`
       INSERT INTO creators (user_id, rate, video_rate, languages, categories, is_online)
       VALUES ($1, $2, $3, $4, $5, false)
@@ -1144,6 +1157,7 @@ module.exports = {
   adminGetTransactions,
   // V38 — Handle, Blocks, Suspension
   updateUserHandle,
+  isHandleAvailable,
   blockUser,
   unblockUser,
   getBlockedUsers,

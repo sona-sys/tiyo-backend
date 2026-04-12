@@ -291,6 +291,31 @@ app.put('/api/users/profile', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/api/users/handle-availability', requireAuth, async (req, res) => {
+  try {
+    const rawHandle = typeof req.query?.handle === 'string' ? req.query.handle : '';
+    const handle = rawHandle.trim().toLowerCase();
+
+    if (!handle) {
+      return res.json({ available: false, reason: 'empty' });
+    }
+
+    if (handle.length < 3 || handle.length > 30) {
+      return res.json({ available: false, reason: 'invalid_length' });
+    }
+
+    if (!/^[a-z0-9_]+$/.test(handle)) {
+      return res.json({ available: false, reason: 'invalid_format' });
+    }
+
+    const available = await db.isHandleAvailable(handle, req.userId);
+    res.json({ available, handle });
+  } catch (err) {
+    console.error('Handle availability error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── CREATORS ROUTE (public — browsing doesn't need auth) ──
 
 app.get('/api/creators', optionalAuth, async (req, res) => {
@@ -307,8 +332,8 @@ app.get('/api/creators', optionalAuth, async (req, res) => {
 
 app.post('/api/creators/register', requireAuth, async (req, res) => {
   try {
-    const { rate, videoRate, bio, languages, categories } = req.body;
-    await db.registerCreator(req.userId, { rate, videoRate, bio, languages, categories });
+    const { bio, languages, categories } = req.body || {};
+    await db.registerCreator(req.userId, { bio, languages, categories });
 
     // Re-fetch user to get updated role
     const user = await db.findUserById(req.userId);
