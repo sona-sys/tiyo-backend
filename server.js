@@ -417,6 +417,71 @@ app.get('/api/creators/dashboard', requireAuth, async (req, res) => {
   }
 });
 
+app.put('/api/creators/payout-details', requireAuth, async (req, res) => {
+  try {
+    const { upiId } = req.body || {};
+    const result = await db.updateCreatorPayoutDetails(req.userId, upiId);
+    if (result?.error === 'invalid_upi') {
+      return res.status(400).json({ error: 'Enter a valid UPI ID' });
+    }
+    if (!result) {
+      return res.status(404).json({ error: 'Creator profile not found' });
+    }
+    res.json({
+      success: true,
+      upiId: result.payout_upi_id || null,
+      updatedAt: result.payout_upi_updated_at || null,
+    });
+  } catch (err) {
+    console.error('Creator payout details error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/payouts/summary', requireAuth, async (req, res) => {
+  try {
+    const summary = await db.getCreatorPayoutSummary(req.userId);
+    if (!summary) return res.status(404).json({ error: 'Creator profile not found' });
+    res.json(summary);
+  } catch (err) {
+    console.error('Creator payout summary error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/payouts', requireAuth, async (req, res) => {
+  try {
+    const payouts = await db.getCreatorPayoutHistory(req.userId);
+    if (!payouts) return res.status(404).json({ error: 'Creator profile not found' });
+    res.json(payouts);
+  } catch (err) {
+    console.error('Creator payout history error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/creators/payout-requests', requireAuth, async (req, res) => {
+  try {
+    const result = await db.createCreatorPayoutRequest(req.userId);
+    if (result?.error === 'creator_not_found') {
+      return res.status(404).json({ error: 'Creator profile not found' });
+    }
+    if (result?.error === 'payout_upi_required') {
+      return res.status(400).json({ error: 'Save your payout UPI before requesting a payout' });
+    }
+    if (result?.error === 'request_already_open') {
+      return res.status(409).json({ error: 'You already have an open payout request' });
+    }
+    if (result?.error === 'no_pending_payout') {
+      return res.status(409).json({ error: 'You do not have any pending payout yet' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Create payout request error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/creators/incoming-calls', requireAuth, async (req, res) => {
   try {
     const calls = await db.getCreatorIncomingCalls(req.userId);
@@ -1004,6 +1069,38 @@ app.get('/api/admin/creators', requireAdmin, async (req, res) => {
   }
 });
 
+app.put('/api/admin/creators/:creatorId/rates', requireAdmin, async (req, res) => {
+  try {
+    const creatorId = parseInt(req.params.creatorId, 10);
+    const rate = Number(req.body?.rate);
+    const videoRate = Number(req.body?.videoRate);
+
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creatorId is required' });
+    }
+    if (!Number.isFinite(rate) || rate <= 0 || !Number.isFinite(videoRate) || videoRate <= 0) {
+      return res.status(400).json({ error: 'Valid positive rate and videoRate are required' });
+    }
+
+    const creator = await db.adminUpdateCreatorRates(creatorId, rate, videoRate);
+    if (!creator) {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    res.json({
+      success: true,
+      creator: {
+        ...creator,
+        rate: parseFloat(creator.rate),
+        videoRate: parseFloat(creator.video_rate),
+      },
+    });
+  } catch (err) {
+    console.error('Admin update creator rates error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/admin/calls', requireAdmin, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -1024,6 +1121,65 @@ app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
     res.json(txns);
   } catch (err) {
     console.error('Admin transactions error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/payouts', requireAdmin, async (req, res) => {
+  try {
+    const payouts = await db.adminGetPayouts();
+    res.json(payouts);
+  } catch (err) {
+    console.error('Admin payouts error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/creators/:creatorId/payouts/mark-paid', requireAdmin, async (req, res) => {
+  try {
+    const creatorId = parseInt(req.params.creatorId, 10);
+    const externalReference = String(req.body?.externalReference || '').trim();
+    const note = String(req.body?.note || '').trim();
+
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creatorId is required' });
+    }
+    if (!externalReference) {
+      return res.status(400).json({ error: 'externalReference is required' });
+    }
+
+    const result = await db.adminMarkCreatorPendingPaid(creatorId, externalReference, note || null);
+    if (result?.error === 'creator_not_found') {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+    if (result?.error === 'no_pending_payout') {
+      return res.status(409).json({ error: 'No pending payout found for this creator' });
+    }
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Admin mark payout paid error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/payout-requests/:requestId/reject', requireAdmin, async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.requestId, 10);
+    const reason = String(req.body?.reason || '').trim();
+
+    if (!Number.isInteger(requestId)) {
+      return res.status(400).json({ error: 'Valid requestId is required' });
+    }
+
+    const request = await db.adminRejectPayoutRequest(requestId, reason || null);
+    if (!request) {
+      return res.status(404).json({ error: 'Open payout request not found' });
+    }
+
+    res.json({ success: true, request });
+  } catch (err) {
+    console.error('Admin reject payout request error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

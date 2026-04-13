@@ -77,6 +77,7 @@
     <div class="px-6 flex gap-2 mb-4 overflow-x-auto">
       <button class="tab-btn active px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('users')">Users</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('creators')">Creators</button>
+      <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('payouts')">Payouts</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('calls')">Calls</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('transactions')">Transactions</button>
       <button class="tab-btn px-4 py-2 rounded-full text-sm font-semibold bg-dark-700 text-gray-300 transition" onclick="switchTab('suspended')">Suspended</button>
@@ -133,9 +134,15 @@
   });
 
   // ─── API helpers ──────────────────────────────────────
-  function api(endpoint) {
-    return fetch(BASE + endpoint, { headers: { 'x-admin-key': adminKey } })
-      .then(r => r.json());
+  function api(endpoint, options) {
+    return fetch(BASE + endpoint, Object.assign({
+      headers: { 'x-admin-key': adminKey },
+    }, options || {}))
+      .then(async (r) => {
+        const json = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(json.error || ('Request failed (' + r.status + ')'));
+        return json;
+      });
   }
 
   // ─── Stats ────────────────────────────────────────────
@@ -175,6 +182,7 @@
     switch (tab) {
       case 'users': return api('/api/admin/users?limit=100').then(renderUsersTable);
       case 'creators': return api('/api/admin/creators').then(renderCreatorsTable);
+      case 'payouts': return api('/api/admin/payouts').then(renderPayoutsTable);
       case 'calls': return api('/api/admin/calls?limit=100').then(renderCallsTable);
       case 'transactions': return api('/api/admin/transactions?limit=100').then(renderTransactionsTable);
       case 'suspended': return api('/api/admin/suspended-users').then(renderSuspendedTable);
@@ -263,6 +271,13 @@
     return '#' + call.endedByUserId;
   }
 
+  function requestBadge(request) {
+    if (!request) {
+      return '<span class="text-gray-500 text-xs">No open request</span>';
+    }
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-900 text-yellow-300">Open · ₹' + request.amount.toFixed(0) + '</span>';
+  }
+
   function renderCallsSummary(calls) {
     const reasonCounts = {};
     let legacyCount = 0;
@@ -331,7 +346,7 @@
     html += '<th class="px-4 py-3">Name</th><th class="px-4 py-3">Status</th>';
     html += '<th class="px-4 py-3">Voice Rate</th><th class="px-4 py-3">Video Rate</th>';
     html += '<th class="px-4 py-3">Rating</th><th class="px-4 py-3">Calls</th>';
-    html += '<th class="px-4 py-3">Earnings</th><th class="px-4 py-3">Balance</th></tr></thead><tbody>';
+    html += '<th class="px-4 py-3">Earnings</th><th class="px-4 py-3">Balance</th><th class="px-4 py-3">UPI</th><th class="px-4 py-3">Action</th></tr></thead><tbody>';
     creators.forEach(c => {
       const status = c.is_online
         ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1"></span>Online'
@@ -345,6 +360,43 @@
       html += '<td class="px-4 py-3 text-sm">' + c.total_calls + '</td>';
       html += '<td class="px-4 py-3 text-sm text-green-400">₹' + c.total_earnings.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm">₹' + c.balance.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">' + (c.payout_upi_id || '<span class=text-gray-600>—</span>') + '</td>';
+      html += '<td class="px-4 py-3"><button onclick="updateCreatorRates(' + c.id + ', ' + c.rate + ', ' + c.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button></td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = html;
+  }
+
+  function renderPayoutsTable(items) {
+    let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
+    html += '<th class="px-4 py-3">Creator</th><th class="px-4 py-3">Status</th>';
+    html += '<th class="px-4 py-3">Pending</th><th class="px-4 py-3">Paid Out</th>';
+    html += '<th class="px-4 py-3">Last Payout</th><th class="px-4 py-3">Open Request</th>';
+    html += '<th class="px-4 py-3">UPI</th><th class="px-4 py-3">Rates</th><th class="px-4 py-3">Actions</th></tr></thead><tbody>';
+    items.forEach(item => {
+      const status = item.is_online
+        ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1"></span>Online'
+        : '<span class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1"></span>Offline';
+      const request = item.open_request_id
+        ? { id: item.open_request_id, amount: item.open_request_amount }
+        : null;
+      html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
+      html += '<td class="px-4 py-3 text-sm"><div class="font-medium text-white">' + (item.name || item.phone || '—') + '</div><div class="text-xs text-gray-500">' + (item.phone || '') + '</div></td>';
+      html += '<td class="px-4 py-3 text-sm">' + status + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-yellow-300">₹' + item.pending_payout.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-green-400">₹' + item.paid_out_till_date.toFixed(0) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-400">' + fmtDate(item.last_payout_date) + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + requestBadge(request) + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">' + (item.payout_upi_id || '<span class=text-gray-600>—</span>') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300">₹' + item.rate + ' / ₹' + item.video_rate + '</td>';
+      html += '<td class="px-4 py-3"><div class="flex flex-col gap-2">';
+      html += '<button onclick="markPayoutPaid(' + item.id + ')" class="bg-green-700 text-white text-xs px-3 py-1 rounded-full hover:bg-green-600">Mark Full Pending Paid</button>';
+      if (request) {
+        html += '<button onclick="rejectPayoutRequest(' + request.id + ')" class="bg-red-700 text-white text-xs px-3 py-1 rounded-full hover:bg-red-600">Reject Request</button>';
+      }
+      html += '<button onclick="updateCreatorRates(' + item.id + ', ' + item.rate + ', ' + item.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button>';
+      html += '</div></td>';
       html += '</tr>';
     });
     html += '</tbody></table>';
@@ -384,13 +436,14 @@
     let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
     html += '<th class="px-4 py-3">ID</th><th class="px-4 py-3">User</th>';
     html += '<th class="px-4 py-3">Amount</th><th class="px-4 py-3">Type</th>';
-    html += '<th class="px-4 py-3">Status</th><th class="px-4 py-3">Date</th></tr></thead><tbody>';
+    html += '<th class="px-4 py-3">Source</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Date</th></tr></thead><tbody>';
     txns.forEach(t => {
       html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
       html += '<td class="px-4 py-3 text-sm text-gray-400">' + t.id + '</td>';
       html += '<td class="px-4 py-3 text-sm">' + (t.user_name || t.user_phone || '—') + '</td>';
       html += '<td class="px-4 py-3 text-sm text-green-400">₹' + t.amount.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-400">' + t.type + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-500">' + ((t.source_type && t.source_id) ? (t.source_type + ' #' + t.source_id) : '—') + '</td>';
       html += '<td class="px-4 py-3">' + statusBadge(t.status) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-500">' + fmtDate(t.created_at) + '</td>';
       html += '</tr>';
@@ -431,6 +484,72 @@
     })
       .then(r => { if (!r.ok) throw new Error('Failed'); return r.json(); })
       .then(() => { alert('User unsuspended!'); loadTab('suspended'); })
+      .catch(err => alert('Error: ' + err.message));
+  }
+
+  function updateCreatorRates(creatorId, currentRate, currentVideoRate) {
+    const nextRate = prompt('Set new voice rate (INR/min)', currentRate);
+    if (nextRate == null) return;
+    const nextVideoRate = prompt('Set new video rate (INR/min)', currentVideoRate);
+    if (nextVideoRate == null) return;
+
+    api('/api/admin/creators/' + creatorId + '/rates', {
+      method: 'PUT',
+      headers: {
+        'x-admin-key': adminKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        rate: Number(nextRate),
+        videoRate: Number(nextVideoRate),
+      }),
+    })
+      .then(() => {
+        alert('Rates updated');
+        loadTab(currentTab);
+      })
+      .catch(err => alert('Error: ' + err.message));
+  }
+
+  function markPayoutPaid(creatorId) {
+    const externalReference = prompt('Enter external payment reference (UPI ref / note)');
+    if (!externalReference) return;
+    const note = prompt('Optional note (leave blank if none)', '') || '';
+
+    api('/api/admin/creators/' + creatorId + '/payouts/mark-paid', {
+      method: 'POST',
+      headers: {
+        'x-admin-key': adminKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        externalReference: externalReference,
+        note: note,
+      }),
+    })
+      .then(() => {
+        alert('Payout recorded');
+        loadTab(currentTab);
+      })
+      .catch(err => alert('Error: ' + err.message));
+  }
+
+  function rejectPayoutRequest(requestId) {
+    const reason = prompt('Reason for rejecting this payout request?', '');
+    if (reason == null) return;
+
+    api('/api/admin/payout-requests/' + requestId + '/reject', {
+      method: 'POST',
+      headers: {
+        'x-admin-key': adminKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: reason }),
+    })
+      .then(() => {
+        alert('Request rejected');
+        loadTab(currentTab);
+      })
       .catch(err => alert('Error: ' + err.message));
   }
 

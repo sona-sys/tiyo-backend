@@ -1,6 +1,12 @@
 const pool = require('./pool');
 const RINGING_TIMEOUT_SECONDS = 35;
 const TERMINAL_REASON_HINTS = new Set(['remote_left', 'network_drop_timeout']);
+const BASIC_UPI_REGEX = /^[a-zA-Z0-9._-]{2,256}@[a-zA-Z0-9.-]{2,64}$/;
+
+const parseMoney = (value) => {
+  const amount = parseFloat(value);
+  return Number.isFinite(amount) ? amount : 0;
+};
 
 // ─── USERS ──────────────────────────────────────────────
 
@@ -136,13 +142,258 @@ async function updateWalletBalance(userId, amount) {
 
 // ─── TRANSACTIONS ───────────────────────────────────────
 
-async function createTransaction(userId, amount, type, status = 'success') {
-  const { rows } = await pool.query(`
-    INSERT INTO transactions (user_id, amount, type, status)
-    VALUES ($1, $2, $3, $4)
+async function createTransaction(userId, amount, type, status = 'success', options = {}) {
+  const client = options.client || pool;
+  const sourceType = options.sourceType || null;
+  const sourceId = options.sourceId == null ? null : String(options.sourceId);
+  const { rows } = await client.query(`
+    INSERT INTO transactions (user_id, amount, type, status, source_type, source_id)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (user_id, type, source_type, source_id)
+    WHERE status = 'success' AND source_type IS NOT NULL AND source_id IS NOT NULL
+    DO NOTHING
     RETURNING *
-  `, [userId, amount, type, status]);
-  return rows[0];
+  `, [userId, amount, type, status, sourceType, sourceId]);
+
+  if (rows[0]) {
+    return rows[0];
+  }
+
+  if (status === 'success' && sourceType && sourceId) {
+    const { rows: existingRows } = await client.query(`
+      SELECT *
+      FROM transactions
+      WHERE user_id = $1
+        AND type = $2
+        AND status = 'success'
+        AND source_type = $3
+        AND source_id = $4
+      LIMIT 1
+    `, [userId, type, sourceType, sourceId]);
+    return existingRows[0] || null;
+  }
+
+  return null;
+}
+
+async function getCreatorPendingEarningTransactions(creatorUserId, client = pool) {
+  const { rows } = await client.query(`
+    SELECT t.id, t.amount, t.created_at, t.source_id
+    FROM transactions t
+    LEFT JOIN creator_payout_items cpi ON cpi.transaction_id = t.id
+    WHERE t.user_id = $1
+      AND t.type = 'call_earning'
+      AND t.status = 'success'
+      AND t.source_type = 'call'
+      AND cpi.transaction_id IS NULL
+    ORDER BY t.created_at ASC, t.id ASC
+  `, [creatorUserId]);
+
+  return rows.map((row) => ({
+    ...row,
+    amount: parseMoney(row.amount),
+  }));
+}
+
+async function getCreatorPayoutSummary(userId, client = pool) {
+  const { rows: creatorRows } = await client.query(`
+    SELECT payout_upi_id, payout_upi_updated_at
+    FROM creators
+    WHERE user_id = $1
+  `, [userId]);
+
+  if (!creatorRows[0]) {
+    return null;
+  }
+
+  const { rows: pendingRows } = await client.query(`
+    SELECT COALESCE(SUM(t.amount), 0) AS pending_payout
+    FROM transactions t
+    LEFT JOIN creator_payout_items cpi ON cpi.transaction_id = t.id
+    WHERE t.user_id = $1
+      AND t.type = 'call_earning'
+      AND t.status = 'success'
+      AND t.source_type = 'call'
+      AND cpi.transaction_id IS NULL
+  `, [userId]);
+
+  const { rows: paidRows } = await client.query(`
+    SELECT
+      COALESCE(SUM(amount), 0) AS paid_out_till_date,
+      MAX(paid_at) AS last_payout_date
+    FROM creator_payouts
+    WHERE creator_user_id = $1
+  `, [userId]);
+
+  const { rows: requestRows } = await client.query(`
+    SELECT
+      id,
+      requested_amount,
+      upi_id,
+      status,
+      reason,
+      payout_id,
+      created_at,
+      resolved_at
+    FROM creator_payout_requests
+    WHERE creator_user_id = $1
+    ORDER BY
+      CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+      created_at DESC
+    LIMIT 1
+  `, [userId]);
+
+  const currentRequest = requestRows[0]
+    ? {
+        id: requestRows[0].id,
+        requestedAmount: parseMoney(requestRows[0].requested_amount),
+        upiId: requestRows[0].upi_id || null,
+        status: requestRows[0].status,
+        reason: requestRows[0].reason || null,
+        payoutId: requestRows[0].payout_id || null,
+        createdAt: requestRows[0].created_at,
+        resolvedAt: requestRows[0].resolved_at,
+      }
+    : null;
+
+  return {
+    payoutUpiId: creatorRows[0].payout_upi_id || null,
+    payoutUpiUpdatedAt: creatorRows[0].payout_upi_updated_at || null,
+    pendingPayout: parseMoney(pendingRows[0]?.pending_payout),
+    paidOutTillDate: parseMoney(paidRows[0]?.paid_out_till_date),
+    lastPayoutDate: paidRows[0]?.last_payout_date || null,
+    currentRequest,
+    hasOpenRequest: currentRequest?.status === 'open',
+  };
+}
+
+async function getCreatorPayoutHistory(userId, client = pool) {
+  const summary = await getCreatorPayoutSummary(userId, client);
+  if (!summary) {
+    return null;
+  }
+
+  const { rows: payoutRows } = await client.query(`
+    SELECT id, amount, upi_id, external_reference, note, paid_at, created_at
+    FROM creator_payouts
+    WHERE creator_user_id = $1
+    ORDER BY paid_at DESC, id DESC
+  `, [userId]);
+
+  const { rows: requestRows } = await client.query(`
+    SELECT id, requested_amount, upi_id, status, reason, payout_id, created_at, resolved_at
+    FROM creator_payout_requests
+    WHERE creator_user_id = $1
+    ORDER BY created_at DESC, id DESC
+  `, [userId]);
+
+  return {
+    summary,
+    payouts: payoutRows.map((row) => ({
+      id: row.id,
+      amount: parseMoney(row.amount),
+      upiId: row.upi_id || null,
+      externalReference: row.external_reference || null,
+      note: row.note || null,
+      paidAt: row.paid_at,
+      createdAt: row.created_at,
+    })),
+    requests: requestRows.map((row) => ({
+      id: row.id,
+      requestedAmount: parseMoney(row.requested_amount),
+      upiId: row.upi_id || null,
+      status: row.status,
+      reason: row.reason || null,
+      payoutId: row.payout_id || null,
+      createdAt: row.created_at,
+      resolvedAt: row.resolved_at,
+    })),
+  };
+}
+
+async function updateCreatorPayoutDetails(userId, upiId) {
+  const normalizedUpi = String(upiId || '').trim().toLowerCase();
+  if (normalizedUpi && !BASIC_UPI_REGEX.test(normalizedUpi)) {
+    return { error: 'invalid_upi' };
+  }
+
+  const { rows } = await pool.query(`
+    UPDATE creators
+    SET payout_upi_id = $1,
+        payout_upi_updated_at = CASE WHEN $1 IS NULL THEN NULL ELSE NOW() END
+    WHERE user_id = $2
+    RETURNING payout_upi_id, payout_upi_updated_at
+  `, [normalizedUpi || null, userId]);
+
+  return rows[0] || null;
+}
+
+async function createCreatorPayoutRequest(userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: creatorRows } = await client.query(`
+      SELECT payout_upi_id
+      FROM creators
+      WHERE user_id = $1
+      FOR UPDATE
+    `, [userId]);
+
+    if (!creatorRows[0]) {
+      await client.query('ROLLBACK');
+      return { error: 'creator_not_found' };
+    }
+
+    const payoutUpiId = creatorRows[0].payout_upi_id || null;
+    if (!payoutUpiId) {
+      await client.query('ROLLBACK');
+      return { error: 'payout_upi_required' };
+    }
+
+    const { rows: openRequestRows } = await client.query(`
+      SELECT id
+      FROM creator_payout_requests
+      WHERE creator_user_id = $1 AND status = 'open'
+      LIMIT 1
+    `, [userId]);
+    if (openRequestRows[0]) {
+      await client.query('ROLLBACK');
+      return { error: 'request_already_open' };
+    }
+
+    const pendingTransactions = await getCreatorPendingEarningTransactions(userId, client);
+    if (pendingTransactions.length === 0) {
+      await client.query('ROLLBACK');
+      return { error: 'no_pending_payout' };
+    }
+
+    const requestedAmount = pendingTransactions.reduce((sum, row) => sum + parseMoney(row.amount), 0);
+
+    const { rows } = await client.query(`
+      INSERT INTO creator_payout_requests (creator_user_id, requested_amount, upi_id, status)
+      VALUES ($1, $2, $3, 'open')
+      RETURNING *
+    `, [userId, requestedAmount, payoutUpiId]);
+
+    await client.query('COMMIT');
+
+    return {
+      request: {
+        id: rows[0].id,
+        requestedAmount: parseMoney(rows[0].requested_amount),
+        upiId: rows[0].upi_id || null,
+        status: rows[0].status,
+        createdAt: rows[0].created_at,
+      },
+      summary: await getCreatorPayoutSummary(userId),
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function getUserTransactions(userId) {
@@ -584,7 +835,18 @@ async function processCallEndById(callId, endedByUserId = null, reasonHint = nul
 
     if (call.status === 'completed' || call.status === 'missed' || call.status === 'rejected') {
       await client.query('ROLLBACK');
-      return { error: 'Call already ended' };
+      return {
+        success: true,
+        alreadyEnded: true,
+        status: call.status,
+        cost: parseMoney(call.total_cost),
+        duration: call.duration_seconds || 0,
+        remainingBalance: null,
+        missed: call.status === 'missed',
+        endReason: call.end_reason || null,
+        endedByUserId: call.ended_by_user_id ?? null,
+        callType: call.call_type || 'voice',
+      };
     }
 
     const callerInitiated = endedByUserId != null && endedByUserId === call.caller_id;
@@ -650,7 +912,7 @@ async function processCallEndById(callId, endedByUserId = null, reasonHint = nul
       'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
       [call.caller_id]
     );
-    const balance = parseFloat(walletRows[0]?.balance || 0);
+    const balance = parseMoney(walletRows[0]?.balance);
     const chargeAmount = Math.min(totalCost, balance);
 
     const { rows: updatedWallet } = await client.query(
@@ -678,16 +940,19 @@ async function processCallEndById(callId, endedByUserId = null, reasonHint = nul
     `, [durationSeconds, chargeAmount, endReason, terminalEndedByUserId, callId]);
 
     // Record transaction for caller (debit)
-    await client.query(
-      `INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'call_debit', 'success')`,
-      [call.caller_id, -chargeAmount]
-    );
+    if (chargeAmount > 0) {
+      await createTransaction(call.caller_id, -chargeAmount, 'call_debit', 'success', {
+        sourceType: 'call',
+        sourceId: call.id,
+        client,
+      });
 
-    // Record transaction for creator (credit / earnings)
-    await client.query(
-      `INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'call_earning', 'success')`,
-      [call.receiver_id, chargeAmount]
-    );
+      await createTransaction(call.receiver_id, chargeAmount, 'call_earning', 'success', {
+        sourceType: 'call',
+        sourceId: call.id,
+        client,
+      });
+    }
 
     await client.query('COMMIT');
 
@@ -696,7 +961,7 @@ async function processCallEndById(callId, endedByUserId = null, reasonHint = nul
       status: 'completed',
       duration: durationSeconds,
       cost: chargeAmount,
-      remainingBalance: parseFloat(updatedWallet[0].balance),
+      remainingBalance: parseMoney(updatedWallet[0].balance),
       endReason,
       endedByUserId: terminalEndedByUserId,
       callType: call.call_type || 'voice',
@@ -901,13 +1166,16 @@ async function getCreatorDashboard(userId) {
     LIMIT 10
   `, [userId]);
 
+  const payoutSummary = await getCreatorPayoutSummary(userId);
+
   return {
     ...creatorRows[0],
-    balance: walletRows[0] ? parseFloat(walletRows[0].balance) : 0,
-    total_earnings: parseFloat(creatorRows[0].total_earnings),
+    balance: walletRows[0] ? parseMoney(walletRows[0].balance) : 0,
+    total_earnings: parseMoney(creatorRows[0].total_earnings),
+    payoutSummary,
     recentCalls: recentCalls.map(c => ({
       ...c,
-      total_cost: c.total_cost ? parseFloat(c.total_cost) : 0,
+      total_cost: c.total_cost ? parseMoney(c.total_cost) : 0,
     })),
   };
 }
@@ -940,6 +1208,171 @@ async function rejectCallById(callId, receiverId = null) {
     WHERE id = $1 AND status = 'ringing'
     RETURNING *
   `, [callId, receiverId]);
+  return rows[0] || null;
+}
+
+// ─── CREATOR PAYOUTS (V44) ────────────────────────────
+
+async function adminGetPayouts() {
+  const { rows } = await pool.query(`
+    SELECT
+      u.id,
+      COALESCE(u.name, u.phone, 'Creator') AS name,
+      u.phone,
+      c.is_online,
+      c.rate,
+      c.video_rate,
+      c.payout_upi_id,
+      COALESCE(pending.pending_payout, 0) AS pending_payout,
+      COALESCE(paid.paid_out_till_date, 0) AS paid_out_till_date,
+      paid.last_payout_date,
+      open_request.id AS open_request_id,
+      open_request.requested_amount AS open_request_amount,
+      open_request.created_at AS open_request_created_at
+    FROM creators c
+    JOIN users u ON u.id = c.user_id
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(t.amount), 0) AS pending_payout
+      FROM transactions t
+      LEFT JOIN creator_payout_items cpi ON cpi.transaction_id = t.id
+      WHERE t.user_id = c.user_id
+        AND t.type = 'call_earning'
+        AND t.status = 'success'
+        AND t.source_type = 'call'
+        AND cpi.transaction_id IS NULL
+    ) pending ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        COALESCE(SUM(amount), 0) AS paid_out_till_date,
+        MAX(paid_at) AS last_payout_date
+      FROM creator_payouts cp
+      WHERE cp.creator_user_id = c.user_id
+    ) paid ON true
+    LEFT JOIN LATERAL (
+      SELECT id, requested_amount, created_at
+      FROM creator_payout_requests cpr
+      WHERE cpr.creator_user_id = c.user_id
+        AND cpr.status = 'open'
+      ORDER BY cpr.created_at DESC
+      LIMIT 1
+    ) open_request ON true
+    ORDER BY
+      (COALESCE(pending.pending_payout, 0) > 0) DESC,
+      COALESCE(pending.pending_payout, 0) DESC,
+      open_request.created_at DESC NULLS LAST,
+      c.total_earnings DESC
+  `);
+
+  return rows.map((row) => ({
+    ...row,
+    rate: parseMoney(row.rate),
+    video_rate: parseMoney(row.video_rate),
+    pending_payout: parseMoney(row.pending_payout),
+    paid_out_till_date: parseMoney(row.paid_out_till_date),
+    open_request_amount: row.open_request_amount == null ? 0 : parseMoney(row.open_request_amount),
+  }));
+}
+
+async function adminMarkCreatorPendingPaid(creatorId, externalReference, note = null) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: creatorRows } = await client.query(`
+      SELECT payout_upi_id
+      FROM creators
+      WHERE user_id = $1
+      FOR UPDATE
+    `, [creatorId]);
+    if (!creatorRows[0]) {
+      await client.query('ROLLBACK');
+      return { error: 'creator_not_found' };
+    }
+
+    const pendingTransactions = await getCreatorPendingEarningTransactions(creatorId, client);
+    if (pendingTransactions.length === 0) {
+      await client.query('ROLLBACK');
+      return { error: 'no_pending_payout' };
+    }
+
+    const payoutAmount = pendingTransactions.reduce((sum, row) => sum + parseMoney(row.amount), 0);
+    const payoutUpiId = creatorRows[0].payout_upi_id || null;
+
+    const { rows: payoutRows } = await client.query(`
+      INSERT INTO creator_payouts (creator_user_id, amount, upi_id, external_reference, note, paid_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      RETURNING *
+    `, [creatorId, payoutAmount, payoutUpiId, externalReference, note || null]);
+    const payout = payoutRows[0];
+
+    const pendingTransactionIds = pendingTransactions.map((row) => row.id);
+    await client.query(`
+      INSERT INTO creator_payout_items (payout_id, transaction_id, amount)
+      SELECT $1, t.id, t.amount
+      FROM transactions t
+      WHERE t.id = ANY($2::int[])
+    `, [payout.id, pendingTransactionIds]);
+
+    await createTransaction(creatorId, payoutAmount, 'payout', 'success', {
+      sourceType: 'payout',
+      sourceId: payout.id,
+      client,
+    });
+
+    await client.query(`
+      UPDATE creator_payout_requests
+      SET status = 'paid',
+          payout_id = $2,
+          reason = NULL,
+          resolved_at = NOW()
+      WHERE creator_user_id = $1
+        AND status = 'open'
+    `, [creatorId, payout.id]);
+
+    await client.query('COMMIT');
+
+    return {
+      payout: {
+        id: payout.id,
+        amount: parseMoney(payout.amount),
+        upiId: payout.upi_id || null,
+        externalReference: payout.external_reference || null,
+        note: payout.note || null,
+        paidAt: payout.paid_at,
+      },
+      summary: await getCreatorPayoutSummary(creatorId),
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function adminRejectPayoutRequest(requestId, reason = null) {
+  const { rows } = await pool.query(`
+    UPDATE creator_payout_requests
+    SET status = 'rejected',
+        reason = $2,
+        resolved_at = NOW()
+    WHERE id = $1
+      AND status = 'open'
+    RETURNING *
+  `, [requestId, String(reason || '').trim() || null]);
+
+  return rows[0] || null;
+}
+
+async function adminUpdateCreatorRates(creatorId, rate, videoRate) {
+  const { rows } = await pool.query(`
+    UPDATE creators
+    SET rate = $1,
+        video_rate = $2
+    WHERE user_id = $3
+    RETURNING user_id, rate, video_rate
+  `, [rate, videoRate, creatorId]);
+
   return rows[0] || null;
 }
 
@@ -985,7 +1418,7 @@ async function adminGetUsers(limit = 50, offset = 0) {
 async function adminGetCreators() {
   const { rows } = await pool.query(`
     SELECT u.id, u.name, u.phone, u.created_at,
-           c.rate, c.video_rate, c.languages, c.categories, c.is_online,
+           c.rate, c.video_rate, c.languages, c.categories, c.is_online, c.payout_upi_id,
            c.rating, c.total_calls, c.total_earnings,
            COALESCE(w.balance, 0) AS balance
     FROM creators c
@@ -1024,7 +1457,7 @@ async function adminGetCalls(limit = 50, offset = 0) {
 
 async function adminGetTransactions(limit = 50, offset = 0) {
   const { rows } = await pool.query(`
-    SELECT t.id, t.amount, t.type, t.status, t.created_at,
+    SELECT t.id, t.amount, t.type, t.status, t.source_type, t.source_id, t.created_at,
            u.name AS user_name, u.phone AS user_phone
     FROM transactions t
     LEFT JOIN users u ON t.user_id = u.id
@@ -1147,8 +1580,16 @@ module.exports = {
   toggleCreatorAvailability,
   setCreatorAvailability,
   getCreatorDashboard,
+  getCreatorPayoutSummary,
+  getCreatorPayoutHistory,
+  updateCreatorPayoutDetails,
+  createCreatorPayoutRequest,
   getCreatorIncomingCalls,
   rejectCallById,
+  adminGetPayouts,
+  adminMarkCreatorPendingPaid,
+  adminRejectPayoutRequest,
+  adminUpdateCreatorRates,
   // V34 — Admin Dashboard
   adminGetStats,
   adminGetUsers,
