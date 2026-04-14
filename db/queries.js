@@ -320,7 +320,7 @@ async function updateCreatorPayoutDetails(userId, upiId) {
   const { rows } = await pool.query(`
     UPDATE creators
     SET payout_upi_id = $1,
-        payout_upi_updated_at = CASE WHEN $1 IS NULL THEN NULL ELSE NOW() END
+        payout_upi_updated_at = CASE WHEN $1::text IS NULL THEN NULL ELSE NOW() END
     WHERE user_id = $2
     RETURNING payout_upi_id, payout_upi_updated_at
   `, [normalizedUpi || null, userId]);
