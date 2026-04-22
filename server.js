@@ -424,27 +424,6 @@ app.get('/api/creators', optionalAuth, async (req, res) => {
   }
 });
 
-app.get('/api/creators/:id(\\d+)', optionalAuth, async (req, res) => {
-  try {
-    const cleanup = await db.cleanupExpiredCallStates();
-    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
-    const creatorId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(creatorId)) {
-      return res.status(400).json({ error: 'Valid creator id is required' });
-    }
-
-    const creator = await db.getCreatorById(creatorId, req.userId);
-    if (!creator || creator.role !== 'creator') {
-      return res.status(404).json({ error: 'Creator not found' });
-    }
-
-    res.json(creator);
-  } catch (err) {
-    console.error('Get creator by id error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // ─── CREATOR MANAGEMENT ROUTES (V32 — protected) ───────
 
 app.post('/api/creators/register', requireAuth, async (req, res) => {
@@ -685,6 +664,27 @@ app.get('/api/creators/incoming-calls', requireAuth, async (req, res) => {
     res.json(calls);
   } catch (err) {
     console.error('Creator incoming calls error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/:id', optionalAuth, async (req, res) => {
+  try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
+    const creatorId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creator id is required' });
+    }
+
+    const creator = await db.getCreatorById(creatorId, req.userId);
+    if (!creator || creator.role !== 'creator') {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    res.json(creator);
+  } catch (err) {
+    console.error('Get creator by id error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
