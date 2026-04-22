@@ -10,10 +10,18 @@ dotenv.config();
 const db = require('./db/queries');
 const { generateToken, requireAuth, optionalAuth } = require('./middleware/auth');
 const { sendOTP, verifyOTP } = require('./auth/supabase');
-const { RAZORPAY_KEY_ID, createOrder, verifyPaymentSignature } = require('./payments/razorpay');
+const {
+  RAZORPAY_KEY_ID,
+  RAZORPAYX_WEBHOOK_SECRET,
+  createOrder,
+  verifyPaymentSignature,
+  verifyWebhookSignature,
+  parseRazorpayXPayoutWebhookEvent,
+} = require('./payments/razorpay');
 const { AGORA_APP_ID, isMockMode: agoraMockMode, generateRtcToken, generateChannelName } = require('./calling/agora');
 const {
   sendCallNotificationToCreator,
+  notifyCreatorFreeCallers,
   clearIncomingCallFallback,
   markIncomingCallAlertDelivered,
 } = require('./services/notifications');
@@ -46,6 +54,64 @@ function buildCallTerminalPayload(call) {
     endedByUserId: call?.ended_by_user_id ?? null,
   };
 }
+
+async function dispatchCreatorFreeAlerts(creatorUserIds = []) {
+  const uniqueCreatorIds = [...new Set(
+    creatorUserIds
+      .map((creatorUserId) => Number(creatorUserId))
+      .filter((creatorUserId) => Number.isInteger(creatorUserId) && creatorUserId > 0)
+  )];
+
+  for (const creatorUserId of uniqueCreatorIds) {
+    try {
+      const result = await db.claimCreatorFreeAlertsForDispatch(creatorUserId);
+      if (!result?.alerts?.length) {
+        continue;
+      }
+
+      await notifyCreatorFreeCallers({
+        creatorUserId,
+        creatorName: result.creator?.creator_name || 'Your creator',
+        callerUserIds: result.alerts.map((alert) => alert.caller_user_id),
+      });
+    } catch (err) {
+      console.error(`Failed to dispatch creator-free alerts for ${creatorUserId}:`, err);
+    }
+  }
+}
+
+app.post('/api/webhooks/razorpayx', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
+  try {
+    if (!RAZORPAYX_WEBHOOK_SECRET) {
+      return res.status(503).json({ error: 'RazorpayX webhook secret is not configured' });
+    }
+
+    const signature = req.headers['x-razorpay-signature'];
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    const isValid = verifyWebhookSignature(rawBody, signature, RAZORPAYX_WEBHOOK_SECRET);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid webhook signature' });
+    }
+
+    const payload = JSON.parse(rawBody.toString('utf8'));
+    const event = parseRazorpayXPayoutWebhookEvent(payload);
+    if (!event?.providerPayoutId) {
+      return res.json({ success: true, ignored: true });
+    }
+
+    const payout = await db.reconcileRazorpayXPayoutWebhook(
+      event.providerPayoutId,
+      event.status,
+      event.failureReason,
+      event.externalReference
+    );
+
+    res.json({ success: true, payoutId: payout?.id || null, providerStatus: payout?.providerStatus || event.status });
+  } catch (err) {
+    console.error('RazorpayX webhook error:', err);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
 
 // ─── SECURITY & PERFORMANCE MIDDLEWARE ─────────────────
 app.use(helmet({
@@ -249,11 +315,39 @@ app.post('/api/users/push-token', requireAuth, async (req, res) => {
 
 app.get('/api/notifications', requireAuth, async (req, res) => {
   try {
-    // V35: stub — returns empty list + unread count for now
-    // Full notification system (DB-backed) can be added later
-    res.json({ notifications: [], unreadCount: 0 });
+    const notifications = await db.getNotificationsForUser(req.userId);
+    res.json(notifications);
   } catch (err) {
     console.error('Notifications error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    const notificationId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(notificationId)) {
+      return res.status(400).json({ error: 'Valid notification id is required' });
+    }
+
+    const notification = await db.markNotificationRead(req.userId, notificationId);
+    if (!notification) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    res.json({ success: true, notification });
+  } catch (err) {
+    console.error('Mark notification read error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  try {
+    const result = await db.markAllNotificationsRead(req.userId);
+    res.json({ success: true, updatedCount: result.updatedCount || 0 });
+  } catch (err) {
+    console.error('Mark all notifications read error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -320,10 +414,33 @@ app.get('/api/users/handle-availability', requireAuth, async (req, res) => {
 
 app.get('/api/creators', optionalAuth, async (req, res) => {
   try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const creators = await db.getCreators(req.userId);
     res.json(creators);
   } catch (err) {
     console.error('Get creators error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/creators/:id(\\d+)', optionalAuth, async (req, res) => {
+  try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
+    const creatorId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creator id is required' });
+    }
+
+    const creator = await db.getCreatorById(creatorId, req.userId);
+    if (!creator || creator.role !== 'creator') {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    res.json(creator);
+  } catch (err) {
+    console.error('Get creator by id error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -359,6 +476,9 @@ app.post('/api/creators/toggle-availability', requireAuth, async (req, res) => {
   try {
     const result = await db.toggleCreatorAvailability(req.userId);
     if (!result) return res.status(404).json({ error: 'Creator not found' });
+    if (result.is_online) {
+      await dispatchCreatorFreeAlerts([req.userId]);
+    }
     res.json({ success: true, isOnline: result.is_online });
   } catch (err) {
     console.error('Toggle availability error:', err);
@@ -375,9 +495,64 @@ app.put('/api/creators/availability', requireAuth, async (req, res) => {
 
     const result = await db.setCreatorAvailability(req.userId, isOnline);
     if (!result) return res.status(404).json({ error: 'Creator not found' });
+    if (isOnline) {
+      await dispatchCreatorFreeAlerts([req.userId]);
+    }
     res.json({ success: true, isOnline: result.is_online });
   } catch (err) {
     console.error('Set availability error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/creators/:creatorId/notify-when-free', requireAuth, async (req, res) => {
+  try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
+    const creatorId = parseInt(req.params.creatorId, 10);
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creator id is required' });
+    }
+    if (creatorId === req.userId) {
+      return res.status(400).json({ error: 'You cannot subscribe to yourself' });
+    }
+
+    const blocked = await db.isBlocked(creatorId, req.userId);
+    if (blocked) {
+      return res.status(403).json({ error: 'This creator is not available' });
+    }
+
+    const result = await db.createOrRefreshCreatorFreeAlert(req.userId, creatorId, req.body?.sourceCallId || null);
+    if (result?.error === 'creator_not_found') {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+    if (result?.error === 'creator_not_busy') {
+      return res.status(409).json({ error: 'This creator is not busy right now', availability: result.availability });
+    }
+
+    res.json({
+      success: true,
+      subscribed: true,
+      refreshed: !!result?.refreshed,
+      expiresAt: result?.alert?.expires_at || null,
+    });
+  } catch (err) {
+    console.error('Notify when free subscribe error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/creators/:creatorId/notify-when-free', requireAuth, async (req, res) => {
+  try {
+    const creatorId = parseInt(req.params.creatorId, 10);
+    if (!Number.isInteger(creatorId)) {
+      return res.status(400).json({ error: 'Valid creator id is required' });
+    }
+
+    const result = await db.cancelCreatorFreeAlert(req.userId, creatorId);
+    res.json({ success: true, cancelled: !!result });
+  } catch (err) {
+    console.error('Notify when free cancel error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -408,6 +583,8 @@ app.post('/api/calls/:callId/alert-received', requireAuth, async (req, res) => {
 
 app.get('/api/creators/dashboard', requireAuth, async (req, res) => {
   try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const dashboard = await db.getCreatorDashboard(req.userId);
     if (!dashboard) return res.status(404).json({ error: 'Creator profile not found' });
     res.json(dashboard);
@@ -424,6 +601,15 @@ app.put('/api/creators/payout-details', requireAuth, async (req, res) => {
     if (result?.error === 'invalid_upi') {
       return res.status(400).json({ error: 'Enter a valid UPI ID' });
     }
+    if (result?.error === 'provider_not_configured') {
+      return res.status(503).json({ error: 'UPI verification is not configured yet' });
+    }
+    if (result?.error === 'verification_failed') {
+      return res.status(400).json({ error: result.message || 'This UPI ID could not be verified' });
+    }
+    if (result?.error === 'verification_retryable') {
+      return res.status(503).json({ error: result.message || 'UPI verification is temporarily unavailable. Please try again.' });
+    }
     if (!result) {
       return res.status(404).json({ error: 'Creator profile not found' });
     }
@@ -431,6 +617,12 @@ app.put('/api/creators/payout-details', requireAuth, async (req, res) => {
       success: true,
       upiId: result.payout_upi_id || null,
       updatedAt: result.payout_upi_updated_at || null,
+      verificationStatus: result.payout_upi_verification_status || 'unverified',
+      verifiedName: result.payout_upi_verified_name || null,
+      verifiedAt: result.payout_upi_verified_at || null,
+      lastError: result.payout_upi_last_error || null,
+      verificationBypass: Boolean(result.verificationBypass),
+      manualFallback: Boolean(result.manualFallback),
     });
   } catch (err) {
     console.error('Creator payout details error:', err);
@@ -469,8 +661,11 @@ app.post('/api/creators/payout-requests', requireAuth, async (req, res) => {
     if (result?.error === 'payout_upi_required') {
       return res.status(400).json({ error: 'Save your payout UPI before requesting a payout' });
     }
+    if (result?.error === 'payout_upi_not_verified') {
+      return res.status(400).json({ error: 'Verify your payout UPI before requesting a payout' });
+    }
     if (result?.error === 'request_already_open') {
-      return res.status(409).json({ error: 'You already have an open payout request' });
+      return res.status(409).json({ error: 'You already have an active payout request' });
     }
     if (result?.error === 'no_pending_payout') {
       return res.status(409).json({ error: 'You do not have any pending payout yet' });
@@ -484,6 +679,8 @@ app.post('/api/creators/payout-requests', requireAuth, async (req, res) => {
 
 app.get('/api/creators/incoming-calls', requireAuth, async (req, res) => {
   try {
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const calls = await db.getCreatorIncomingCalls(req.userId);
     res.json(calls);
   } catch (err) {
@@ -499,7 +696,8 @@ app.post('/api/calls/accept', requireAuth, async (req, res) => {
       return sendCallError(res, 400, 'callId is required', 'invalid_request');
     }
 
-    await db.cleanupExpiredCallStates();
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const existingCall = await db.getCallById(callId);
     if (!existingCall || existingCall.receiver_id !== req.userId) {
       return sendCallError(res, 404, 'Call not found', 'ended');
@@ -544,7 +742,8 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
       return sendCallError(res, 400, 'callId is required', 'invalid_request');
     }
 
-    await db.cleanupExpiredCallStates();
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
       return sendCallError(res, 404, 'Call not found', 'ended');
@@ -561,6 +760,7 @@ app.post('/api/calls/reject', requireAuth, async (req, res) => {
       return sendCallError(res, 409, 'This call has already ended', 'ended');
     }
     clearIncomingCallFallback(call.id);
+    await dispatchCreatorFreeAlerts([call.receiver_id]);
 
     console.log(`Call rejected by creator: ${callId}`);
     res.json({ success: true });
@@ -702,13 +902,22 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       return sendCallError(res, 403, 'Your account is suspended. Contact support.', 'suspended');
     }
 
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
+
     const receiver = await db.getCreatorById(receiverId);
     if (!receiver || receiver.role !== 'creator') {
       return sendCallError(res, 404, 'Creator not found', 'unavailable');
     }
 
     const receiverStatus = await db.getUserStatus(receiverId);
-    if (receiverStatus !== 'active' || !receiver.online) {
+    if (receiverStatus !== 'active') {
+      return sendCallError(res, 409, 'This creator is unavailable right now.', 'unavailable');
+    }
+    if (receiver.availability === 'busy') {
+      return sendCallError(res, 409, 'This creator is currently on another call.', 'busy', { busyTarget: 'creator' });
+    }
+    if (!receiver.canCall) {
       return sendCallError(res, 409, 'This creator is unavailable right now.', 'unavailable');
     }
 
@@ -718,16 +927,14 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
       return sendCallError(res, 403, 'This creator is not available', 'blocked');
     }
 
-    await db.cleanupExpiredCallStates();
-
     const callerOngoingCall = await db.getOngoingCallForUser(callerId);
     if (callerOngoingCall) {
-      return sendCallError(res, 409, 'You already have a call in progress.', 'busy');
+      return sendCallError(res, 409, 'You already have a call in progress.', 'busy', { busyTarget: 'caller' });
     }
 
     const receiverOngoingCall = await db.getOngoingCallForUser(receiverId);
     if (receiverOngoingCall) {
-      return sendCallError(res, 409, 'This creator is currently on another call.', 'busy');
+      return sendCallError(res, 409, 'This creator is currently on another call.', 'busy', { busyTarget: 'creator' });
     }
 
     // Generate unique channel name
@@ -735,6 +942,12 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 
     // Create call record in DB
     const call = await db.initiateCall(callerId, receiverId, channelName, callType || 'voice');
+    if (call?.error === 'caller_busy') {
+      return sendCallError(res, 409, 'You already have a call in progress.', 'busy', { busyTarget: 'caller' });
+    }
+    if (call?.error === 'receiver_busy' || call?.error === 'busy') {
+      return sendCallError(res, 409, 'This creator is currently on another call.', 'busy', { busyTarget: 'creator' });
+    }
 
     // Generate Agora token for the caller
     const tokenData = generateRtcToken(channelName, callerId);
@@ -775,7 +988,8 @@ app.post('/api/calls/start', requireAuth, async (req, res) => {
 app.get('/api/calls/:callId/status', requireAuth, async (req, res) => {
   try {
     const { callId } = req.params;
-    await db.cleanupExpiredCallStates();
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const call = await db.getCallById(callId);
     if (!call) return res.status(404).json({ error: 'Call not found' });
     if (call.caller_id !== req.userId && call.receiver_id !== req.userId) {
@@ -861,7 +1075,8 @@ app.post('/api/calls/connect', requireAuth, async (req, res) => {
       return sendCallError(res, 400, 'callId is required', 'invalid_request');
     }
 
-    await db.cleanupExpiredCallStates();
+    const cleanup = await db.cleanupExpiredCallStates();
+    await dispatchCreatorFreeAlerts(cleanup?.freedCreatorIds || []);
     const existingCall = await db.getCallById(callId);
     if (!existingCall) {
       return sendCallError(res, 404, 'Call not found', 'ended');
@@ -923,6 +1138,7 @@ app.post('/api/calls/end', requireAuth, async (req, res) => {
       return sendCallError(res, 400, result.error, 'ended');
     }
     clearIncomingCallFallback(callId);
+    await dispatchCreatorFreeAlerts([result?.creatorUserId]);
     return res.json(result);
   } catch (err) {
     console.error('End call error:', err);
@@ -1135,30 +1351,35 @@ app.get('/api/admin/payouts', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/creators/:creatorId/payouts/mark-paid', requireAdmin, async (req, res) => {
+app.post('/api/admin/creators/:creatorId/payouts/approve-send', requireAdmin, async (req, res) => {
   try {
     const creatorId = parseInt(req.params.creatorId, 10);
-    const externalReference = String(req.body?.externalReference || '').trim();
     const note = String(req.body?.note || '').trim();
 
     if (!Number.isInteger(creatorId)) {
       return res.status(400).json({ error: 'Valid creatorId is required' });
     }
-    if (!externalReference) {
-      return res.status(400).json({ error: 'externalReference is required' });
-    }
 
-    const result = await db.adminMarkCreatorPendingPaid(creatorId, externalReference, note || null);
+    const result = await db.adminApproveAndSendCreatorPayout(creatorId, note || null);
     if (result?.error === 'creator_not_found') {
       return res.status(404).json({ error: 'Creator not found' });
+    }
+    if (result?.error === 'payout_upi_not_verified') {
+      return res.status(409).json({ error: 'Creator does not have a verified payout UPI yet' });
     }
     if (result?.error === 'no_pending_payout') {
       return res.status(409).json({ error: 'No pending payout found for this creator' });
     }
+    if (result?.error === 'provider_not_configured') {
+      return res.status(503).json({ error: result.message || 'RazorpayX payouts are not configured yet' });
+    }
+    if (result?.error === 'provider_send_failed') {
+      return res.status(502).json({ error: result.message || 'Could not send payout to RazorpayX', ...result });
+    }
 
     res.json({ success: true, ...result });
   } catch (err) {
-    console.error('Admin mark payout paid error:', err);
+    console.error('Admin approve payout error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1180,6 +1401,39 @@ app.post('/api/admin/payout-requests/:requestId/reject', requireAdmin, async (re
     res.json({ success: true, request });
   } catch (err) {
     console.error('Admin reject payout request error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/payouts/:payoutId/retry', requireAdmin, async (req, res) => {
+  try {
+    const payoutId = parseInt(req.params.payoutId, 10);
+    const note = String(req.body?.note || '').trim();
+
+    if (!Number.isInteger(payoutId)) {
+      return res.status(400).json({ error: 'Valid payoutId is required' });
+    }
+
+    const result = await db.adminRetryFailedPayout(payoutId, note || null);
+    if (result?.error === 'failed_payout_not_found') {
+      return res.status(404).json({ error: 'Failed payout not found' });
+    }
+    if (result?.error === 'payout_upi_not_verified') {
+      return res.status(409).json({ error: 'Creator does not have a verified payout UPI yet' });
+    }
+    if (result?.error === 'no_pending_payout') {
+      return res.status(409).json({ error: 'No pending payout available to retry' });
+    }
+    if (result?.error === 'provider_not_configured') {
+      return res.status(503).json({ error: result.message || 'RazorpayX payouts are not configured yet' });
+    }
+    if (result?.error === 'provider_send_failed') {
+      return res.status(502).json({ error: result.message || 'Could not resend payout to RazorpayX', ...result });
+    }
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Admin retry payout error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

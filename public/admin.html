@@ -93,9 +93,30 @@
     </div>
   </div>
 
+  <div id="adminModal" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/70 px-4">
+    <div class="w-full max-w-lg rounded-2xl border border-dark-600 bg-dark-800 p-6 shadow-2xl">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <h2 id="adminModalTitle" class="text-lg font-semibold text-white">Action</h2>
+          <p id="adminModalDescription" class="mt-2 text-sm text-gray-400"></p>
+        </div>
+        <button onclick="closeAdminModal()" class="bg-dark-700 px-3 py-1 text-sm text-gray-300">Close</button>
+      </div>
+      <form id="adminModalForm" class="mt-5 space-y-4">
+        <div id="adminModalFields" class="space-y-4"></div>
+        <p id="adminModalError" class="hidden text-sm text-red-400"></p>
+        <div class="flex justify-end gap-3 pt-2">
+          <button type="button" onclick="closeAdminModal()" class="bg-dark-700 text-gray-200">Cancel</button>
+          <button id="adminModalSubmit" type="submit" class="bg-accent text-dark-900">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
 <script>
   let adminKey = '';
   const BASE = window.location.origin;
+  const modalState = { onSubmit: null, submitLabel: 'Save' };
 
   // ─── Auth ─────────────────────────────────────────────
   function doLogin() {
@@ -144,6 +165,69 @@
         return json;
       });
   }
+
+  function closeAdminModal() {
+    document.getElementById('adminModal').classList.add('hidden');
+    document.getElementById('adminModal').classList.remove('flex');
+    document.getElementById('adminModalFields').innerHTML = '';
+    document.getElementById('adminModalError').textContent = '';
+    document.getElementById('adminModalError').classList.add('hidden');
+    document.getElementById('adminModalSubmit').disabled = false;
+    document.getElementById('adminModalSubmit').textContent = modalState.submitLabel;
+    modalState.onSubmit = null;
+  }
+
+  function openAdminModal(config) {
+    modalState.onSubmit = config.onSubmit;
+    modalState.submitLabel = config.submitLabel || 'Save';
+    document.getElementById('adminModalTitle').textContent = config.title || 'Action';
+    document.getElementById('adminModalDescription').textContent = config.description || '';
+    document.getElementById('adminModalSubmit').textContent = modalState.submitLabel;
+    document.getElementById('adminModalFields').innerHTML = (config.fields || []).map((field) => {
+      const type = field.multiline ? 'textarea' : 'input';
+      const common = 'w-full rounded-xl border border-dark-600 bg-dark-900 px-4 py-3 text-white focus:outline-none focus:border-accent';
+      const base = '<label class="block"><span class="mb-2 block text-sm font-medium text-gray-300">' + field.label + '</span>';
+      if (type === 'textarea') {
+        return base + '<textarea data-modal-field="' + field.name + '" rows="' + (field.rows || 3) + '" placeholder="' + (field.placeholder || '') + '" class="' + common + '">' + (field.value || '') + '</textarea></label>';
+      }
+      return base + '<input data-modal-field="' + field.name + '" type="' + (field.type || 'text') + '" value="' + (field.value || '') + '" placeholder="' + (field.placeholder || '') + '" class="' + common + '" /></label>';
+    }).join('');
+    document.getElementById('adminModalError').textContent = '';
+    document.getElementById('adminModalError').classList.add('hidden');
+    document.getElementById('adminModal').classList.remove('hidden');
+    document.getElementById('adminModal').classList.add('flex');
+    const firstField = document.querySelector('[data-modal-field]');
+    if (firstField) {
+      setTimeout(() => firstField.focus(), 0);
+    }
+  }
+
+  document.getElementById('adminModalForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!modalState.onSubmit) return;
+
+    const submitBtn = document.getElementById('adminModalSubmit');
+    const errorEl = document.getElementById('adminModalError');
+    const fields = {};
+    document.querySelectorAll('[data-modal-field]').forEach((field) => {
+      fields[field.getAttribute('data-modal-field')] = field.value;
+    });
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Working...';
+    errorEl.textContent = '';
+    errorEl.classList.add('hidden');
+
+    try {
+      await modalState.onSubmit(fields);
+      closeAdminModal();
+    } catch (err) {
+      errorEl.textContent = err.message || 'Something went wrong';
+      errorEl.classList.remove('hidden');
+      submitBtn.disabled = false;
+      submitBtn.textContent = modalState.submitLabel;
+    }
+  });
 
   // ─── Stats ────────────────────────────────────────────
   function renderStats(stats) {
@@ -273,9 +357,50 @@
 
   function requestBadge(request) {
     if (!request) {
-      return '<span class="text-gray-500 text-xs">No open request</span>';
+      return '<span class="text-gray-500 text-xs">No active request</span>';
     }
-    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-900 text-yellow-300">Open · ₹' + request.amount.toFixed(0) + '</span>';
+    const status = request.status || 'open';
+    const styles = {
+      open: 'bg-yellow-900 text-yellow-300',
+      processing: 'bg-blue-900 text-blue-300',
+      paid: 'bg-green-900 text-green-300',
+      rejected: 'bg-dark-700 text-gray-300',
+      failed: 'bg-red-900 text-red-300',
+    };
+    const labels = {
+      open: 'Open',
+      processing: 'Processing',
+      paid: 'Paid',
+      rejected: 'Rejected',
+      failed: 'Failed',
+    };
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + (styles[status] || 'bg-dark-700 text-gray-300') + '">' + (labels[status] || status) + ' · ₹' + Number(request.amount || 0).toFixed(0) + '</span>';
+  }
+
+  function verificationBadge(status) {
+    const styles = {
+      verified: 'bg-green-900 text-green-300',
+      failed: 'bg-red-900 text-red-300',
+      unverified: 'bg-dark-700 text-gray-300',
+    };
+    const label = status === 'verified' ? 'Verified' : status === 'failed' ? 'Verification Failed' : 'Needs Verification';
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + (styles[status] || 'bg-dark-700 text-gray-300') + '">' + label + '</span>';
+  }
+
+  function providerBadge(status) {
+    if (!status) {
+      return '<span class="text-gray-500 text-xs">No payout sent yet</span>';
+    }
+    const normalized = String(status).toLowerCase();
+    const styles = {
+      processed: 'bg-green-900 text-green-300',
+      processing: 'bg-blue-900 text-blue-300',
+      failed: 'bg-red-900 text-red-300',
+      rejected: 'bg-red-900 text-red-300',
+      reversed: 'bg-orange-900 text-orange-300',
+    };
+    const label = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+    return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + (styles[normalized] || 'bg-dark-700 text-gray-300') + '">' + label + '</span>';
   }
 
   function renderCallsSummary(calls) {
@@ -361,7 +486,7 @@
       html += '<td class="px-4 py-3 text-sm text-green-400">₹' + c.total_earnings.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm">₹' + c.balance.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-300">' + (c.payout_upi_id || '<span class=text-gray-600>—</span>') + '</td>';
-      html += '<td class="px-4 py-3"><button onclick="updateCreatorRates(' + c.id + ', ' + c.rate + ', ' + c.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button></td>';
+      html += '<td class="px-4 py-3"><button onclick="openUpdateRatesModal(' + c.id + ', ' + c.rate + ', ' + c.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button></td>';
       html += '</tr>';
     });
     html += '</tbody></table>';
@@ -372,30 +497,42 @@
     let html = '<table><thead><tr class="bg-dark-700 text-left text-xs text-gray-400 uppercase">';
     html += '<th class="px-4 py-3">Creator</th><th class="px-4 py-3">Status</th>';
     html += '<th class="px-4 py-3">Pending</th><th class="px-4 py-3">Paid Out</th>';
-    html += '<th class="px-4 py-3">Last Payout</th><th class="px-4 py-3">Open Request</th>';
-    html += '<th class="px-4 py-3">UPI</th><th class="px-4 py-3">Rates</th><th class="px-4 py-3">Actions</th></tr></thead><tbody>';
+    html += '<th class="px-4 py-3">Last Payout</th><th class="px-4 py-3">Request</th>';
+    html += '<th class="px-4 py-3">Verified UPI</th><th class="px-4 py-3">Provider</th><th class="px-4 py-3">Rates</th><th class="px-4 py-3">Actions</th></tr></thead><tbody>';
     items.forEach(item => {
       const status = item.is_online
         ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1"></span>Online'
         : '<span class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1"></span>Offline';
-      const request = item.open_request_id
-        ? { id: item.open_request_id, amount: item.open_request_amount }
+      const request = item.current_request_id
+        ? {
+            id: item.current_request_id,
+            amount: item.current_request_amount,
+            status: item.current_request_status,
+            reason: item.current_request_reason,
+          }
         : null;
+      const canApprove = Number(item.pending_payout || 0) > 0 && item.payout_upi_verification_status === 'verified';
+      const canReject = request && request.status === 'open';
+      const canRetry = ['failed', 'rejected', 'reversed'].includes(String(item.latest_payout_provider_status || '').toLowerCase()) && Number(item.pending_payout || 0) > 0;
       html += '<tr class="border-t border-dark-700 hover:bg-dark-700/50">';
       html += '<td class="px-4 py-3 text-sm"><div class="font-medium text-white">' + (item.name || item.phone || '—') + '</div><div class="text-xs text-gray-500">' + (item.phone || '') + '</div></td>';
       html += '<td class="px-4 py-3 text-sm">' + status + '</td>';
       html += '<td class="px-4 py-3 text-sm text-yellow-300">₹' + item.pending_payout.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-green-400">₹' + item.paid_out_till_date.toFixed(0) + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-400">' + fmtDate(item.last_payout_date) + '</td>';
-      html += '<td class="px-4 py-3 text-sm">' + requestBadge(request) + '</td>';
-      html += '<td class="px-4 py-3 text-sm text-gray-300">' + (item.payout_upi_id || '<span class=text-gray-600>—</span>') + '</td>';
+      html += '<td class="px-4 py-3 text-sm">' + requestBadge(request) + (request && request.reason ? '<div class="mt-1 text-xs text-red-300">' + request.reason + '</div>' : '') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300"><div>' + (item.payout_upi_id || '<span class=text-gray-600>—</span>') + '</div><div class="mt-1">' + verificationBadge(item.payout_upi_verification_status || 'unverified') + '</div>' + (item.payout_upi_verified_name ? '<div class="mt-1 text-xs text-green-300">' + item.payout_upi_verified_name + '</div>' : '') + (item.payout_upi_last_error ? '<div class="mt-1 text-xs text-red-300">' + item.payout_upi_last_error + '</div>' : '') + '</td>';
+      html += '<td class="px-4 py-3 text-sm text-gray-300"><div>' + providerBadge(item.latest_payout_provider_status) + '</div>' + (item.latest_payout_failure_reason ? '<div class="mt-1 text-xs text-red-300">' + item.latest_payout_failure_reason + '</div>' : '') + (item.latest_payout_provider_payout_id ? '<div class="mt-1 text-xs text-gray-500">' + item.latest_payout_provider_payout_id + '</div>' : '') + '</td>';
       html += '<td class="px-4 py-3 text-sm text-gray-300">₹' + item.rate + ' / ₹' + item.video_rate + '</td>';
       html += '<td class="px-4 py-3"><div class="flex flex-col gap-2">';
-      html += '<button onclick="markPayoutPaid(' + item.id + ')" class="bg-green-700 text-white text-xs px-3 py-1 rounded-full hover:bg-green-600">Mark Full Pending Paid</button>';
-      if (request) {
-        html += '<button onclick="rejectPayoutRequest(' + request.id + ')" class="bg-red-700 text-white text-xs px-3 py-1 rounded-full hover:bg-red-600">Reject Request</button>';
+      html += '<button onclick="approvePayoutSend(' + item.id + ', ' + Number(item.pending_payout || 0) + ')" class="bg-green-700 text-white text-xs px-3 py-1 rounded-full hover:bg-green-600 ' + (canApprove ? '' : 'opacity-50 cursor-not-allowed') + '" ' + (canApprove ? '' : 'disabled') + '>Approve &amp; Send Full Pending</button>';
+      if (canReject) {
+        html += '<button onclick="openRejectPayoutRequestModal(' + request.id + ')" class="bg-red-700 text-white text-xs px-3 py-1 rounded-full hover:bg-red-600">Reject Request</button>';
       }
-      html += '<button onclick="updateCreatorRates(' + item.id + ', ' + item.rate + ', ' + item.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button>';
+      if (canRetry) {
+        html += '<button onclick="openRetryPayoutModal(' + item.latest_payout_id + ')" class="bg-orange-700 text-white text-xs px-3 py-1 rounded-full hover:bg-orange-600">Retry Failed Payout</button>';
+      }
+      html += '<button onclick="openUpdateRatesModal(' + item.id + ', ' + item.rate + ', ' + item.video_rate + ')" class="bg-dark-600 text-white text-xs px-3 py-1 rounded-full hover:bg-dark-700">Update Rates</button>';
       html += '</div></td>';
       html += '</tr>';
     });
@@ -487,70 +624,92 @@
       .catch(err => alert('Error: ' + err.message));
   }
 
-  function updateCreatorRates(creatorId, currentRate, currentVideoRate) {
-    const nextRate = prompt('Set new voice rate (INR/min)', currentRate);
-    if (nextRate == null) return;
-    const nextVideoRate = prompt('Set new video rate (INR/min)', currentVideoRate);
-    if (nextVideoRate == null) return;
-
-    api('/api/admin/creators/' + creatorId + '/rates', {
-      method: 'PUT',
-      headers: {
-        'x-admin-key': adminKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        rate: Number(nextRate),
-        videoRate: Number(nextVideoRate),
-      }),
-    })
-      .then(() => {
-        alert('Rates updated');
+  function openUpdateRatesModal(creatorId, currentRate, currentVideoRate) {
+    openAdminModal({
+      title: 'Update Creator Rates',
+      description: 'Server-owned pricing stays in admin control. Update the voice and video rates here.',
+      submitLabel: 'Save Rates',
+      fields: [
+        { name: 'rate', label: 'Voice Rate (INR/min)', type: 'number', value: String(currentRate || '') },
+        { name: 'videoRate', label: 'Video Rate (INR/min)', type: 'number', value: String(currentVideoRate || '') },
+      ],
+      onSubmit: ({ rate, videoRate }) => api('/api/admin/creators/' + creatorId + '/rates', {
+        method: 'PUT',
+        headers: {
+          'x-admin-key': adminKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          rate: Number(rate),
+          videoRate: Number(videoRate),
+        }),
+      }).then(() => {
         loadTab(currentTab);
-      })
-      .catch(err => alert('Error: ' + err.message));
+      }),
+    });
   }
 
-  function markPayoutPaid(creatorId) {
-    const externalReference = prompt('Enter external payment reference (UPI ref / note)');
-    if (!externalReference) return;
-    const note = prompt('Optional note (leave blank if none)', '') || '';
-
-    api('/api/admin/creators/' + creatorId + '/payouts/mark-paid', {
-      method: 'POST',
-      headers: {
-        'x-admin-key': adminKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        externalReference: externalReference,
-        note: note,
-      }),
-    })
-      .then(() => {
-        alert('Payout recorded');
+  function approvePayoutSend(creatorId, pendingAmount) {
+    openAdminModal({
+      title: 'Approve & Send Full Pending',
+      description: 'This will send the full current pending payout of ₹' + Number(pendingAmount || 0).toFixed(0) + ' through RazorpayX after approval.',
+      submitLabel: 'Approve & Send',
+      fields: [
+        { name: 'note', label: 'Optional note', multiline: true, rows: 3, placeholder: 'Monthly run, early payout, or internal note' },
+      ],
+      onSubmit: ({ note }) => api('/api/admin/creators/' + creatorId + '/payouts/approve-send', {
+        method: 'POST',
+        headers: {
+          'x-admin-key': adminKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ note: note || '' }),
+      }).then(() => {
         loadTab(currentTab);
-      })
-      .catch(err => alert('Error: ' + err.message));
+      }),
+    });
   }
 
-  function rejectPayoutRequest(requestId) {
-    const reason = prompt('Reason for rejecting this payout request?', '');
-    if (reason == null) return;
-
-    api('/api/admin/payout-requests/' + requestId + '/reject', {
-      method: 'POST',
-      headers: {
-        'x-admin-key': adminKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ reason: reason }),
-    })
-      .then(() => {
-        alert('Request rejected');
+  function openRejectPayoutRequestModal(requestId) {
+    openAdminModal({
+      title: 'Reject Payout Request',
+      description: 'Reject this early payout request. The creator can request again later.',
+      submitLabel: 'Reject Request',
+      fields: [
+        { name: 'reason', label: 'Reason', multiline: true, rows: 3, placeholder: 'Reason visible in admin and creator history' },
+      ],
+      onSubmit: ({ reason }) => api('/api/admin/payout-requests/' + requestId + '/reject', {
+        method: 'POST',
+        headers: {
+          'x-admin-key': adminKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: reason || '' }),
+      }).then(() => {
         loadTab(currentTab);
-      })
-      .catch(err => alert('Error: ' + err.message));
+      }),
+    });
+  }
+
+  function openRetryPayoutModal(payoutId) {
+    openAdminModal({
+      title: 'Retry Failed Payout',
+      description: 'Retry this failed payout using a fresh RazorpayX payout attempt and new idempotency key.',
+      submitLabel: 'Retry Payout',
+      fields: [
+        { name: 'note', label: 'Optional note', multiline: true, rows: 3, placeholder: 'Retry reason or operator note' },
+      ],
+      onSubmit: ({ note }) => api('/api/admin/payouts/' + payoutId + '/retry', {
+        method: 'POST',
+        headers: {
+          'x-admin-key': adminKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ note: note || '' }),
+      }).then(() => {
+        loadTab(currentTab);
+      }),
+    });
   }
 
   // ─── Refresh all data ─────────────────────────────────

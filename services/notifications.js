@@ -8,6 +8,7 @@ let loggedInitFailure = false;
 const FALLBACK_DELAY_MS = 4000;
 const pendingIncomingCallFallbacks = new Map();
 const deliveredIncomingCallAlerts = new Set();
+const CREATOR_ALERTS_CHANNEL_ID = 'creator-alerts-v1';
 
 function normalizePrivateKey(value) {
   return typeof value === 'string' ? value.replace(/\\n/g, '\n') : value;
@@ -92,6 +93,32 @@ async function clearStoredPushToken(userId) {
   } catch (err) {
     console.error(`Failed to clear push token for user ${userId}:`, err.message);
   }
+}
+
+async function storeNotification({ userId, title, body, type, data = {} }) {
+  if (!userId || !title || !body || !type) {
+    return null;
+  }
+
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO notifications (user_id, title, body, type, data)
+      VALUES ($1, $2, $3, $4, $5::jsonb)
+      RETURNING *
+    `, [userId, title, body, type, JSON.stringify(data || {})]);
+    return rows[0] || null;
+  } catch (err) {
+    console.error(`Failed to store notification for user ${userId}:`, err.message);
+    return null;
+  }
+}
+
+async function getPushTokenForUser(userId) {
+  const { rows } = await pool.query(
+    'SELECT push_token FROM users WHERE id = $1',
+    [userId]
+  );
+  return rows[0]?.push_token || null;
 }
 
 async function sendPushNotification({
@@ -279,11 +306,7 @@ async function sendCallNotificationToCreator({
   channelName,
   callType = 'voice',
 }) {
-  const { rows } = await pool.query(
-    'SELECT push_token FROM users WHERE id = $1',
-    [creatorUserId]
-  );
-  const pushToken = rows[0]?.push_token;
+  const pushToken = await getPushTokenForUser(creatorUserId);
   if (!pushToken) {
     console.log(`No push token for creator ${creatorUserId}`);
     return null;
@@ -325,9 +348,92 @@ async function sendCallNotificationToCreator({
   return result;
 }
 
+async function sendCreatorFreeNotification({
+  callerUserId,
+  creatorUserId,
+  creatorName,
+}) {
+  const displayName = creatorName || 'Your creator';
+  const title = `${displayName} is free now`;
+  const body = `Tap to view ${displayName} and call if you’re still interested.`;
+  const data = {
+    type: 'creator_free',
+    creatorId: creatorUserId,
+    creatorName: displayName,
+    channelId: CREATOR_ALERTS_CHANNEL_ID,
+    sticky: false,
+    autoDismiss: true,
+  };
+
+  await storeNotification({
+    userId: callerUserId,
+    title,
+    body,
+    type: 'creator_free',
+    data,
+  });
+
+  const pushToken = await getPushTokenForUser(callerUserId);
+  if (!pushToken) {
+    return null;
+  }
+
+  return sendPushNotification({
+    userId: callerUserId,
+    pushToken,
+    title,
+    body,
+    data,
+    android: {
+      priority: 'high',
+      ttl: 3600000,
+      notification: {
+        channelId: CREATOR_ALERTS_CHANNEL_ID,
+        tag: `creator-free-${creatorUserId}`,
+        clickAction: 'DEFAULT',
+        sound: 'default',
+        defaultSound: true,
+        defaultVibrateTimings: true,
+        visibility: 'private',
+      },
+    },
+    notification: {
+      title,
+      body,
+    },
+  });
+}
+
+async function notifyCreatorFreeCallers({ creatorUserId, creatorName, callerUserIds = [] }) {
+  const uniqueCallerIds = [...new Set(
+    callerUserIds
+      .map((callerUserId) => Number(callerUserId))
+      .filter((callerUserId) => Number.isInteger(callerUserId) && callerUserId > 0)
+  )];
+
+  if (!uniqueCallerIds.length) {
+    return { notifiedCount: 0 };
+  }
+
+  await Promise.all(uniqueCallerIds.map((callerUserId) =>
+    sendCreatorFreeNotification({
+      callerUserId,
+      creatorUserId,
+      creatorName,
+    }).catch((err) => {
+      console.error(`Failed to notify caller ${callerUserId} that creator ${creatorUserId} is free:`, err.message);
+      return null;
+    })
+  ));
+
+  return { notifiedCount: uniqueCallerIds.length };
+}
+
 module.exports = {
   sendPushNotification,
   sendCallNotificationToCreator,
+  notifyCreatorFreeCallers,
+  storeNotification,
   clearIncomingCallFallback,
   markIncomingCallAlertDelivered,
 };
